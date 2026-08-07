@@ -167,7 +167,7 @@ export async function searchRules(opts: {
  *   const doc = await getDocumentDetail('2024-00001');
  */
 export async function getDocumentDetail(documentNumber: string): Promise<FRDocument> {
-  return api.get<FRDocument>(`/documents/${documentNumber}.json`);
+  return api.get<FRDocument>(`/documents/${encodeURIComponent(documentNumber)}.json`);
 }
 
 /**

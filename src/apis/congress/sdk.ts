@@ -1568,6 +1568,10 @@ const xmlParser = new XMLParser({
     name === "recorded-vote" || name === "totals-by-party",
   // Parse numeric-looking values as numbers
   parseTagValue: true,
+  // Don't expand custom/DTD entities from the response body — this XML comes
+  // from clerk.house.gov / senate.gov, but there's no reason to leave entity
+  // expansion on for externally-sourced XML.
+  processEntities: false,
 });
 
 /** Parse XML string into a JS object using fast-xml-parser. */

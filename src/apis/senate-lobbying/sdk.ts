@@ -171,7 +171,7 @@ export async function searchFilings(opts: {
 
 /** Get a specific filing by UUID — includes full lobbying activity detail. */
 export async function getFilingDetail(uuid: string): Promise<LdaFiling> {
-  return api.get<LdaFiling>(`/filings/${uuid}/`);
+  return api.get<LdaFiling>(`/filings/${encodeURIComponent(uuid)}/`);
 }
 
 /** Search lobbying contributions (campaign donations by lobbyists). */

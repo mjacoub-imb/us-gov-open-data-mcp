@@ -79,22 +79,104 @@ export interface DatasetColumn {
 // ─── Portal validation (SSRF guard) ─────────────────────────────────────
 //
 // `domain` is caller-supplied (ultimately LLM/user-driven text), and it
-// flows straight into a server-side fetch(). Restrict it to plausible
-// public-hostname shapes and block loopback/link-local/private targets.
+// flows straight into a server-side fetch() carrying our SOCRATA_APP_TOKEN.
+// A denylist of string prefixes ("127.", "10.", ...) is NOT sufficient here:
+// it misses whole private ranges (172.16.0.0/12), internal hostnames that
+// don't look like IPs at all (postgres.railway.internal,
+// metadata.google.internal), and encoded IP literals (octal "0177.0.0.1" ==
+// 127.0.0.1 to a getaddrinfo()-based resolver). Any of those would both
+// reach an internal service AND hand it our app token.
+//
+// So the default is an allowlist: only the curated STATE_PORTALS /
+// CITY_PORTALS / FEDERAL_PORTALS above are permitted, and only those ever
+// receive the SOCRATA_APP_TOKEN header (see `portal()` below). Operators who
+// need to reach a Socrata portal outside the curated list can opt in via
+// SOCRATA_ALLOW_ANY_PORTAL=true, in which case the app token is still
+// withheld from unlisted hosts and the private-range checks below apply as
+// defense in depth (DNS-rebinding — a hostname that resolves to a private IP
+// only at request time — is NOT covered; that requires validating the
+// resolved address at connect time, not just the hostname string).
 
 const HOSTNAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
-const BLOCKED_PREFIXES = ["localhost", "127.", "10.", "192.168.", "169.254.", "0."];
 
-/** Validate and normalize a Socrata portal hostname. Throws on anything unsafe. */
-export function assertPortal(domain: string): string {
+const KNOWN_PORTALS = new Set<string>(
+  [...Object.values(STATE_PORTALS), ...Object.values(CITY_PORTALS), ...Object.values(FEDERAL_PORTALS)]
+    .map(d => d.toLowerCase()),
+);
+
+/** Read at call time (not import time) — same convention as createClient's
+ *  auth resolution, and lets ops toggle this without restarting the process. */
+function allowAnyPortal(): boolean {
+  return /^(1|true)$/i.test(process.env.SOCRATA_ALLOW_ANY_PORTAL ?? "");
+}
+
+function normalizeHostname(domain: string): string {
   const d = domain.trim().toLowerCase()
     .replace(/^https?:\/\//, "")
     .replace(/\/.*$/, "")
     .replace(/:\d+$/, "");
-  if (!d || !HOSTNAME_RE.test(d)) {
+  if (!d || !HOSTNAME_RE.test(d) || d.includes("@")) {
     throw new Error(`socrata: "${domain}" doesn't look like a valid portal hostname (expected e.g. "data.ny.gov")`);
   }
-  if (BLOCKED_PREFIXES.some(p => d.startsWith(p)) || d.includes("@")) {
+  return d;
+}
+
+/**
+ * Parse a hostname as an IPv4 literal, honoring legacy inet_aton radix rules
+ * (leading "0x" = hex, leading "0" = octal) that some resolvers still accept
+ * and that string-prefix denylists silently miss (e.g. "0177.0.0.1" === 127.0.0.1).
+ * Returns the four octets, or null if `host` isn't an all-numeric dotted quad.
+ */
+function parseIPv4Literal(host: string): [number, number, number, number] | null {
+  const labels = host.split(".");
+  if (labels.length !== 4) return null;
+  const octets: number[] = [];
+  for (const label of labels) {
+    // Number()/parseInt() with an implicit radix both read "0177" as decimal
+    // 177, not octal 127 — the radix has to be picked explicitly per prefix,
+    // or the octal/hex forms this function exists to catch parse as the
+    // wrong (non-matching, so falsely "safe") value.
+    let n: number;
+    if (/^0x[0-9a-f]+$/i.test(label)) n = parseInt(label, 16);
+    else if (/^0[0-7]+$/.test(label)) n = parseInt(label, 8);
+    else if (/^[0-9]+$/.test(label)) n = parseInt(label, 10);
+    else return null;
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    octets.push(n);
+  }
+  return octets as [number, number, number, number];
+}
+
+function isPrivateOrReservedHost(host: string): boolean {
+  if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal")) return true;
+  const ip = parseIPv4Literal(host);
+  if (!ip) return false;
+  const [a, b] = ip;
+  return (
+    a === 0 || a === 127 || a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254)
+  );
+}
+
+/** True only for portals on the curated allowlist — the only ones that get SOCRATA_APP_TOKEN attached. */
+export function isKnownPortal(domain: string): boolean {
+  return KNOWN_PORTALS.has(domain);
+}
+
+/** Validate and normalize a Socrata portal hostname. Throws on anything unsafe or unrecognized. */
+export function assertPortal(domain: string): string {
+  const d = normalizeHostname(domain);
+  if (KNOWN_PORTALS.has(d)) return d;
+
+  if (!allowAnyPortal()) {
+    throw new Error(
+      `socrata: "${d}" is not a recognized Socrata portal. Call socrata_list_portals for known hostnames, ` +
+      `or set SOCRATA_ALLOW_ANY_PORTAL=true to permit other portals (advanced use — see docs).`,
+    );
+  }
+  if (isPrivateOrReservedHost(d)) {
     throw new Error(`socrata: portal "${d}" is not allowed`);
   }
   return d;
@@ -116,7 +198,12 @@ function portal(domain: string): ApiClient {
     client = createClient({
       baseUrl: `https://${d}`,
       name: `socrata:${d}`,
-      auth: { type: "header", envParams: { "X-App-Token": "SOCRATA_APP_TOKEN" } },
+      // Only ever attach the app token to curated, known-safe portals — never
+      // to a caller-supplied host admitted via SOCRATA_ALLOW_ANY_PORTAL, which
+      // would otherwise hand our credential to a domain we don't control.
+      auth: isKnownPortal(d)
+        ? { type: "header", envParams: { "X-App-Token": "SOCRATA_APP_TOKEN" } }
+        : undefined,
       rateLimit: { perSecond: 2, burst: 5 },
       cacheTtlMs: 6 * 60 * 60 * 1000, // 6 hours — state/local datasets update at varying cadences
     });
@@ -180,7 +267,7 @@ export async function getDatasetColumns(domain: string, datasetId: string): Prom
   columns: DatasetColumn[];
 }> {
   const client = portal(domain);
-  const raw = await client.get<any>(`/api/views/${datasetId}.json`);
+  const raw = await client.get<any>(`/api/views/${encodeURIComponent(datasetId)}.json`);
   const columns: DatasetColumn[] = (raw.columns ?? []).map((c: any) => ({
     fieldName: c.fieldName,
     name: c.name,
@@ -202,7 +289,7 @@ export async function queryDataset(domain: string, datasetId: string, opts: {
   q?: string;         // full-text search across the dataset
 } = {}): Promise<SocrataRecord[]> {
   const client = portal(domain);
-  return client.get<SocrataRecord[]>(`/resource/${datasetId}.json`, {
+  return client.get<SocrataRecord[]>(`/resource/${encodeURIComponent(datasetId)}.json`, {
     "$select": opts.select,
     "$where": opts.where,
     "$group": opts.group,
