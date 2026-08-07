@@ -167,8 +167,15 @@ export const xbrlConcepts = {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+/**
+ * A CIK is purely numeric. Strip anything else before interpolating it into
+ * a path — `cik` is caller-supplied text, and without this a value like
+ * "1/../../other-endpoint" would reach the URL unescaped.
+ */
 function padCik(cik: string): string {
-  return cik.padStart(10, "0");
+  const digits = cik.replace(/\D/g, "");
+  if (!digits) throw new Error(`sec: "${cik}" is not a valid CIK (expected digits only, e.g. "320193")`);
+  return digits.padStart(10, "0");
 }
 
 // ─── Public API ──────────────────────────────────────────────────────

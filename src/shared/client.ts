@@ -113,6 +113,12 @@ export interface ApiClient {
 // CS algorithm: https://en.wikipedia.org/wiki/Token_bucket
 
 export class TokenBucket {
+  /** Max callers allowed to queue for a token at once. Without this, a burst
+   *  far larger than the configured rate (e.g. many concurrent requests
+   *  arriving over the HTTP transport) accumulates unbounded pending
+   *  promises — this caps that growth and fails fast instead. */
+  static readonly MAX_QUEUE_LENGTH = 500;
+
   private tokens: number;
   private lastRefill: number;
   private readonly queue: Array<() => void> = [];
@@ -141,6 +147,10 @@ export class TokenBucket {
     if (this.tokens >= 1 && this.queue.length === 0) {
       this.tokens -= 1;
       return;
+    }
+
+    if (this.queue.length >= TokenBucket.MAX_QUEUE_LENGTH) {
+      throw new Error("Rate limiter queue is full — too many concurrent requests. Try again shortly.");
     }
 
     // Slow path: join the queue and wait for the drain loop to release us
@@ -388,20 +398,63 @@ class DiskCache {
 }
 
 // ─── Fetch with timeout ──────────────────────────────────────────────
+//
+// The AbortController's timer must stay alive until the response BODY is
+// fully read, not just until headers arrive. `fetch()` resolves as soon as
+// headers are in; a slow/stalled upstream can then trickle the body forever
+// with no deadline unless the same signal still covers `res.json()`/`.text()`.
+// So `fetchTimeout` returns the live timer for the caller to clear once body
+// consumption finishes (successfully or not) — never before.
 
-async function fetchTimeout(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
+interface TimedResponse { res: Response; clearTimer: () => void }
+
+async function fetchTimeout(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<TimedResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const clearTimer = () => clearTimeout(timer);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    return { res, clearTimer };
+  } catch (e) {
+    clearTimer();
+    throw e;
   }
+}
+
+/** Max response body size we'll read into memory (50MB). Guards against a
+ *  slow/malicious upstream streaming an unbounded body into process memory. */
+const MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
+
+/** Read a response body as text, aborting once it exceeds `maxBytes`. */
+async function readBodyCapped(res: Response, maxBytes: number): Promise<string> {
+  const reader = res.body?.getReader();
+  if (!reader) return res.text();
+
+  const decoder = new TextDecoder();
+  let text = "";
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`Response body exceeded ${(maxBytes / 1024 / 1024).toFixed(0)}MB limit`);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  text += decoder.decode();
+  return text;
 }
 
 // ─── Retry logic ─────────────────────────────────────────────────────
 
 const RETRYABLE = [429, 502, 503, 504];
+
+/** Ceiling on how long we'll sleep for a server-supplied Retry-After — an
+ *  upstream sending "Retry-After: 86400" shouldn't be able to hang a request
+ *  for a full day. */
+const MAX_RETRY_DELAY_MS = 30_000;
 
 /**
  * Parse a `Retry-After` header value.
@@ -436,21 +489,23 @@ async function fetchRetry(
   limiter: TokenBucket,
   name: string,
   maxRetries = 2,
-): Promise<Response> {
+): Promise<TimedResponse> {
   let lastErr: Error | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     await limiter.acquire();
     try {
-      const res = await fetchTimeout(url, init, timeoutMs);
+      const { res, clearTimer } = await fetchTimeout(url, init, timeoutMs);
       if (RETRYABLE.includes(res.status) && attempt < maxRetries) {
+        clearTimer();
+        await res.body?.cancel().catch(() => {});
         const retryAfterMs = parseRetryAfter(res.headers.get("Retry-After"));
-        const delay = retryAfterMs ?? backoffDelay(attempt);
+        const delay = Math.min(retryAfterMs ?? backoffDelay(attempt), MAX_RETRY_DELAY_MS);
         console.error(`${name}: HTTP ${res.status}, retry in ${delay}ms (${attempt + 1}/${maxRetries})`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      return res;
+      return { res, clearTimer };
     } catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
       if (attempt < maxRetries) {
@@ -535,6 +590,29 @@ export function createClient(config: ClientConfig): ApiClient {
     return parts.length ? `${baseUrl}${p}?${parts.join("&")}` : `${baseUrl}${p}`;
   }
 
+  /**
+   * Same shape as `buildUrl`, but WITHOUT auth params — used only to derive
+   * the disk cache key, never sent over the network. `buildUrl`'s output
+   * (which does carry the API key/token) must never be used as a cache key:
+   * `cache.json` is written to disk namespaced by module name and would
+   * otherwise persist secrets in plaintext.
+   */
+  function buildCacheKeyUrl(path: string, params?: Params): string {
+    const parts: string[] = [];
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        if (v === undefined || v === "") continue;
+        if (Array.isArray(v)) {
+          for (const item of v) parts.push(`${k}=${encodeURIComponent(String(item))}`);
+        } else {
+          parts.push(`${k}=${encodeURIComponent(String(v))}`);
+        }
+      }
+    }
+    const p = path.startsWith("/") ? path : `/${path}`;
+    return parts.length ? `${baseUrl}${p}?${parts.join("&")}` : `${baseUrl}${p}`;
+  }
+
   function buildHeaders(extra?: Record<string, string>): Record<string, string> {
     const h: Record<string, string> = { ...defaultHeaders, ...extra };
     if (auth?.type === "header") {
@@ -543,58 +621,70 @@ export function createClient(config: ClientConfig): ApiClient {
     return h;
   }
 
-  async function request<T>(url: string, init?: RequestInit, responseType: "json" | "text" = "json"): Promise<T> {
-    // Check cache (keyed by URL + body + response type so JSON and text never collide)
-    const cacheKey = `${url}|${init?.body ?? ""}|${responseType}`;
+  async function request<T>(
+    url: string,
+    cacheKey: string,
+    init?: RequestInit,
+    responseType: "json" | "text" = "json",
+  ): Promise<T> {
     const cached = cache.get(cacheKey);
     if (cached !== undefined) return cached as T;
 
-    const res = await fetchRetry(url, init, timeoutMs, limiter, name, configMaxRetries);
+    const { res, clearTimer } = await fetchRetry(url, init, timeoutMs, limiter, name, configMaxRetries);
+    try {
+      if (!res.ok) {
+        const body = await readBodyCapped(res, MAX_RESPONSE_BYTES);
 
-    if (!res.ok) {
-      const body = await res.text();
+        // Friendly error for auth failures when no credentials are configured
+        if ((res.status === 401 || res.status === 403) && auth && !hasAuth()) {
+          const envVars = Object.values(auth.envParams).join(", ");
+          throw new Error(
+            `${name}: API key required (HTTP ${res.status}). ` +
+            `Set the ${envVars} environment variable(s) in your .env file or MCP config.`,
+          );
+        }
 
-      // Friendly error for auth failures when no credentials are configured
-      if ((res.status === 401 || res.status === 403) && auth && !hasAuth()) {
-        const envVars = Object.values(auth.envParams).join(", ");
-        throw new Error(
-          `${name}: API key required (HTTP ${res.status}). ` +
-          `Set the ${envVars} environment variable(s) in your .env file or MCP config.`,
-        );
+        throw new Error(`${name}: HTTP ${res.status} — ${truncateBody(body || res.statusText)}`);
       }
 
-      throw new Error(`${name}: HTTP ${res.status} — ${truncateBody(body || res.statusText)}`);
+      if (responseType === "text") {
+        const text = await readBodyCapped(res, MAX_RESPONSE_BYTES);
+        cache.set(cacheKey, text);
+        return text as T;
+      }
+
+      const bodyText = await readBodyCapped(res, MAX_RESPONSE_BYTES);
+      const data = JSON.parse(bodyText);
+
+      // Check for API-level errors in body
+      if (checkError) {
+        const err = checkError(data);
+        if (err) throw new Error(`${name}: ${err}`);
+      }
+
+      cache.set(cacheKey, data);
+      return data as T;
+    } finally {
+      // Only released once the body is fully consumed (or the read itself
+      // aborts) — the deadline must cover the whole request, not just
+      // headers. See fetchTimeout.
+      clearTimer();
     }
-
-    if (responseType === "text") {
-      const text = await res.text();
-      cache.set(cacheKey, text);
-      return text as T;
-    }
-
-    const data = await res.json();
-
-    // Check for API-level errors in body
-    if (checkError) {
-      const err = checkError(data);
-      if (err) throw new Error(`${name}: ${err}`);
-    }
-
-    cache.set(cacheKey, data);
-    return data as T;
   }
 
   return {
     async get<T = unknown>(path: string, params?: Params): Promise<T> {
       const url = buildUrl(path, params);
+      const cacheKey = `${buildCacheKeyUrl(path, params)}||json`;
       const headers = buildHeaders();
-      return request<T>(url, Object.keys(headers).length ? { headers } : undefined);
+      return request<T>(url, cacheKey, Object.keys(headers).length ? { headers } : undefined);
     },
 
     async getText(path: string, params?: Params): Promise<string> {
       const url = buildUrl(path, params);
+      const cacheKey = `${buildCacheKeyUrl(path, params)}||text`;
       const headers = buildHeaders();
-      return request<string>(url, Object.keys(headers).length ? { headers } : undefined, "text");
+      return request<string>(url, cacheKey, Object.keys(headers).length ? { headers } : undefined, "text");
     },
 
     async post<T = unknown>(
@@ -603,6 +693,9 @@ export function createClient(config: ClientConfig): ApiClient {
       params?: Params,
     ): Promise<T> {
       const url = buildUrl(path, params);
+      // Cache key uses the caller-supplied body only — not `finalBody` below,
+      // which may have auth credentials merged in for body-based auth (e.g. BLS).
+      const cacheKey = `${buildCacheKeyUrl(path, params)}|${JSON.stringify(body ?? {})}|json`;
       const headers = buildHeaders({ "Content-Type": "application/json" });
 
       // Auth via body (e.g. BLS)
@@ -615,7 +708,7 @@ export function createClient(config: ClientConfig): ApiClient {
         }
       }
 
-      return request<T>(url, {
+      return request<T>(url, cacheKey, {
         method: "POST",
         headers,
         body: JSON.stringify(finalBody),

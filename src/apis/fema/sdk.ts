@@ -300,7 +300,7 @@ export async function queryDataset(opts: {
   if (opts.orderBy) params.$orderby = opts.orderBy;
   if (opts.skip) params.$skip = String(opts.skip);
 
-  const res = await api.get(`/${endpoint}`, params);
+  const res = await api.get(`/${encodeURIComponent(endpoint)}`, params);
   return extractArray<unknown>(res, endpoint);
 }
 

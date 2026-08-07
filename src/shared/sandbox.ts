@@ -50,6 +50,41 @@ const TIMEOUT_MS = 10_000;
 /** Max DATA size we'll inject into the sandbox (10MB). */
 const MAX_DATA_BYTES = 10 * 1024 * 1024;
 
+/**
+ * Max stdout size we'll accumulate on the HOST (256KB).
+ *
+ * `runtime.setMemoryLimit()` below only bounds QuickJS's own WASM linear
+ * memory — the `stdout` string built up in the console.log callback lives on
+ * Node's heap and is NOT covered by that limit. A script that logs in a tight
+ * loop (e.g. `for (;;) console.log("x".repeat(1e5))`) can grow stdout past
+ * several hundred MB in under a second and OOM-kill the host process,
+ * regardless of the sandbox's own memory cap.
+ */
+const MAX_STDOUT_BYTES = 256 * 1024;
+
+/** Max concurrent sandbox executions. Each one reserves up to 64MB of WASM
+ *  memory plus up to 10MB of DATA; unbounded concurrency on a shared process
+ *  (e.g. behind the HTTP transport) can exhaust host memory well before any
+ *  single execution's own limits kick in. */
+const MAX_CONCURRENT = 3;
+let _active = 0;
+const _queue: Array<() => void> = [];
+
+async function acquireSlot(): Promise<void> {
+  if (_active < MAX_CONCURRENT) {
+    _active++;
+    return;
+  }
+  await new Promise<void>(resolve => _queue.push(resolve));
+  _active++;
+}
+
+function releaseSlot(): void {
+  _active--;
+  const next = _queue.shift();
+  if (next) next();
+}
+
 // ─── Executor ────────────────────────────────────────────────────────
 
 /**
@@ -86,14 +121,27 @@ export async function executeInSandbox(data: string, script: string): Promise<Sa
     };
   }
 
+  await acquireSlot();
+  try {
+    return await runScript(data, script, beforeBytes);
+  } finally {
+    releaseSlot();
+  }
+}
+
+async function runScript(data: string, script: string, beforeBytes: number): Promise<SandboxResult> {
   const qjs = await getRuntime();
   const runtime = qjs.newRuntime();
 
   // Set interrupt handler for timeout
   const deadline = Date.now() + TIMEOUT_MS;
-  runtime.setInterruptHandler(shouldInterruptAfterDeadline(deadline));
+  const deadlineHandler = shouldInterruptAfterDeadline(deadline);
+  let stdoutTruncated = false;
+  runtime.setInterruptHandler(rt => stdoutTruncated || !!deadlineHandler(rt));
 
-  // Memory limit: 64MB (generous for JSON processing)
+  // Memory limit: 64MB (generous for JSON processing). NOTE: this only bounds
+  // QuickJS's own WASM memory — it does NOT bound the `stdout` string below,
+  // which lives on the host's heap. See MAX_STDOUT_BYTES.
   runtime.setMemoryLimit(64 * 1024 * 1024);
 
   const vm = runtime.newContext();
@@ -106,16 +154,38 @@ export async function executeInSandbox(data: string, script: string): Promise<Sa
 
     // ─── Capture console.log → stdout ──────────────────────────────
     let stdout = "";
+    let stdoutBytes = 0;
     const logFn = vm.newFunction("log", (...args) => {
+      if (stdoutTruncated) return;
       const parts = args.map(a => {
         // Handle different QuickJS types
         const type = vm.typeof(a);
         if (type === "string") return vm.getString(a);
         // For numbers, booleans, objects — dump and stringify
-        const dumped = vm.dump(a);
-        return typeof dumped === "object" ? JSON.stringify(dumped) : String(dumped);
+        let dumped: unknown;
+        try {
+          dumped = vm.dump(a);
+        } catch {
+          return "[unserializable]";
+        }
+        if (typeof dumped !== "object" || dumped === null) return String(dumped);
+        try {
+          return JSON.stringify(dumped);
+        } catch {
+          return "[circular or unserializable object]";
+        }
       });
-      stdout += parts.join(" ") + "\n";
+      const line = parts.join(" ") + "\n";
+      stdoutBytes += Buffer.byteLength(line, "utf-8");
+      if (stdoutBytes > MAX_STDOUT_BYTES) {
+        // Stop accumulating on the host heap immediately, and halt the script
+        // on its next interrupt check — no point burning the rest of the
+        // 10s timeout on output we're discarding.
+        stdoutTruncated = true;
+        stdout += `\n[output truncated at ${Math.round(MAX_STDOUT_BYTES / 1024)}KB — narrow your console.log calls]`;
+        return;
+      }
+      stdout += line;
     });
 
     const consoleObj = vm.newObject();
@@ -128,6 +198,21 @@ export async function executeInSandbox(data: string, script: string): Promise<Sa
     const result = vm.evalCode(script);
 
     if (result.error) {
+      // If we interrupted the script ourselves because stdout hit the cap,
+      // that's not a script failure — return what we captured, truncated,
+      // instead of surfacing the interrupt as an error.
+      if (stdoutTruncated) {
+        result.error.dispose();
+        const trimmed = stdout.trimEnd();
+        const afterBytes = Buffer.byteLength(trimmed, "utf-8");
+        return {
+          stdout: trimmed,
+          beforeBytes,
+          afterBytes,
+          reductionPct: Math.max(0, beforeBytes > 0 ? (1 - afterBytes / beforeBytes) * 100 : 0),
+        };
+      }
+
       const errDump = vm.dump(result.error);
       result.error.dispose();
       const errMsg = typeof errDump === "object" ? JSON.stringify(errDump) : String(errDump);

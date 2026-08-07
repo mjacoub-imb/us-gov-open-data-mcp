@@ -202,7 +202,7 @@ export async function searchDatasets(keyword: string): Promise<CmsDatasetSummary
  */
 export async function getDatasetDetails(datasetId: string): Promise<CmsDatasetDetail | null> {
   try {
-    const res = (await api.get(`/metastore/schemas/dataset/items/${datasetId}`, {
+    const res = (await api.get(`/metastore/schemas/dataset/items/${encodeURIComponent(datasetId)}`, {
       "show-reference-ids": "",
     })) as Record<string, unknown>;
     if (!res || !res.identifier) return null;

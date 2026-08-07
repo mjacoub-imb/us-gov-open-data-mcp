@@ -27,6 +27,7 @@ import "dotenv/config";
 import { readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { timingSafeEqual } from "crypto";
 import { FastMCP, type Tool, type InputPrompt } from "fastmcp";
 import { z } from "zod";
 import { buildInstructions } from "./server/instructions.js";
@@ -81,7 +82,8 @@ function parseArgs() {
   };
 
   const transport = (get("--transport") ?? process.env.MCP_TRANSPORT ?? "stdio") as "stdio" | "httpStream";
-  const port = Number(get("--port") ?? process.env.MCP_PORT ?? 8080);
+  // Railway (and most PaaS) inject PORT; prefer explicit overrides but fall back to it.
+  const port = Number(get("--port") ?? process.env.MCP_PORT ?? process.env.PORT ?? 8080);
   const modulesFilter = get("--modules") ?? process.env.MODULES;
   const listModules = args.includes("--list-modules") || args.includes("--list");
 
@@ -168,6 +170,32 @@ for (const mod of activeModules) {
   }
 }
 
+// ─── HTTP transport auth ──────────────────────────────────────────────
+//
+// The stdio transport is trusted-by-construction (one local process talking
+// to one local client over a pipe). httpStream is not — it's a network
+// listener, and this server holds live API keys for ~40 upstream services.
+// Refuse to expose it without a bearer token: failing open here would let
+// anyone who finds the URL burn our API quotas and use us as an open proxy.
+
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+
+if (transport === "httpStream" && !MCP_AUTH_TOKEN) {
+  console.error(
+    "MCP_AUTH_TOKEN is required when using --transport httpStream (refusing to start unauthenticated on a network listener). " +
+    "Set MCP_AUTH_TOKEN to a long random secret and pass it as a Bearer token or ?token= query param.",
+  );
+  process.exit(1);
+}
+
+/** Constant-time string compare — avoids leaking the token via response-timing side channels. */
+function safeTokenEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
 // ─── Server ──────────────────────────────────────────────────────────
 
 const server = new FastMCP({
@@ -175,6 +203,21 @@ const server = new FastMCP({
   version: "2.0.0",
   logger,
   instructions: buildInstructions(activeModules),
+  health: { enabled: true, path: "/health", message: "ok" },
+  ...(MCP_AUTH_TOKEN && {
+    authenticate: async (request: import("http").IncomingMessage) => {
+      const header = request.headers.authorization ?? "";
+      const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+      const url = new URL(request.url ?? "", "http://localhost");
+      const queryToken = url.searchParams.get("token") ?? "";
+      const provided = bearer || queryToken;
+
+      if (!provided || !safeTokenEqual(provided, MCP_AUTH_TOKEN)) {
+        throw new Response(null, { status: 401, statusText: "Unauthorized" });
+      }
+      return { authenticated: true };
+    },
+  }),
 });
 
 // ─── Register all module tools + prompts ─────────────────────────────
@@ -249,11 +292,21 @@ const TOOL_ALIASES: Record<string, string> = {
   // "fda_search_events": "fda_drug_events",
 };
 
-// Build a lookup map of all registered tools for code_mode to call
-const allToolMap = new Map<string, (args: Record<string, unknown>) => Promise<unknown>>();
+// Build a lookup map of all registered tools for code_mode to call.
+// Keep the schema alongside execute — code_mode calls execute() directly,
+// bypassing the framework's own CallToolRequestSchema handler (and the
+// "~standard".validate() step it normally runs before invoking a tool), so
+// code_mode has to replicate that validation itself or every tool's Zod
+// schema — enum constraints, numeric bounds, format checks — becomes
+// unenforced for any call routed through here.
+interface RegisteredTool {
+  parameters?: { "~standard": { validate: (value: unknown) => Promise<{ value: unknown; issues?: readonly { path?: readonly (string | number)[]; message: string }[] }> } };
+  execute: (args: Record<string, unknown>, context: unknown) => Promise<unknown>;
+}
+const allToolMap = new Map<string, RegisteredTool>();
 for (const mod of activeModules) {
   for (const tool of mod.tools) {
-    allToolMap.set(tool.name, (tool as any).execute);
+    allToolMap.set(tool.name, tool as unknown as RegisteredTool);
   }
 }
 
@@ -292,13 +345,29 @@ server.addTool({
       "Only console.log output is returned — keep it concise."
     ),
   }),
-  execute: async ({ tool: toolName, tool_args: toolArgs, code }, { reportProgress }) => {
+  execute: async ({ tool: toolName, tool_args: toolArgs, code }, context) => {
+    const { reportProgress } = context;
     // Resolve any deprecated alias to the current canonical name
     const resolvedName = TOOL_ALIASES[toolName] ?? toolName;
-    const toolFn = allToolMap.get(resolvedName);
-    if (!toolFn) {
+    const registered = allToolMap.get(resolvedName);
+    if (!registered) {
       const available = [...allToolMap.keys()].sort().join(", ");
       return `Error: tool '${toolName}' not found. Available tools: ${available}`;
+    }
+
+    // Validate tool_args against the target tool's own schema — the same
+    // check FastMCP's normal CallToolRequestSchema handler runs, which this
+    // direct execute() call would otherwise skip entirely.
+    let validatedArgs: Record<string, unknown> = toolArgs ?? {};
+    if (registered.parameters) {
+      const parsed = await registered.parameters["~standard"].validate(toolArgs ?? {});
+      if (parsed.issues) {
+        const friendly = parsed.issues
+          .map(issue => `${issue.path?.join(".") || "root"}: ${issue.message}`)
+          .join(", ");
+        return `Error: invalid tool_args for '${resolvedName}': ${friendly}`;
+      }
+      validatedArgs = parsed.value as Record<string, unknown>;
     }
 
     await reportProgress({ progress: 0, total: 2 });
@@ -306,7 +375,7 @@ server.addTool({
     // Call the underlying tool
     let rawResult: string;
     try {
-      const result = await toolFn(toolArgs ?? {});
+      const result = await registered.execute(validatedArgs, context);
       rawResult = typeof result === "string" ? result : JSON.stringify(result);
     } catch (err) {
       return `Error calling '${toolName}': ${(err as Error).message}`;
@@ -407,19 +476,41 @@ server.addResource({
 
 // ─── Start ───────────────────────────────────────────────────────────
 
-if (transport === "httpStream") {
-  server.start({
-    transportType: "httpStream",
-    httpStream: {
-      port,
-      // Bind to localhost only — prevents network exposure.
-      // Set MCP_HOST=0.0.0.0 to allow external access (e.g. behind a reverse proxy).
-      host: process.env.MCP_HOST ?? "127.0.0.1",
-    },
+async function main(): Promise<void> {
+  if (transport === "httpStream") {
+    await server.start({
+      transportType: "httpStream",
+      httpStream: {
+        port,
+        // Bind to localhost only — prevents network exposure.
+        // Set MCP_HOST=0.0.0.0 to allow external access (e.g. behind a reverse proxy/PaaS like Railway).
+        host: process.env.MCP_HOST ?? "127.0.0.1",
+      },
+    });
+    const host = process.env.MCP_HOST ?? "127.0.0.1";
+    console.error(`MCP server listening on http://${host}:${port}/mcp (HTTP Stream)`);
+    console.error(`Health check: http://${host}:${port}/health`);
+    console.error(`${activeModules.length} modules, ${activeModules.reduce((n, m) => n + m.tools.length, 0)} tools`);
+  } else {
+    await server.start({ transportType: "stdio" });
+  }
+}
+
+main().catch(err => {
+  console.error("Fatal error starting MCP server:", err);
+  process.exit(1);
+});
+
+// Railway (and most container platforms) send SIGTERM on every deploy/restart.
+// Exit promptly so the platform doesn't wait out its grace period and SIGKILL us
+// mid-request.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, async () => {
+    console.error(`${signal} received, shutting down...`);
+    try {
+      await server.stop();
+    } finally {
+      process.exit(0);
+    }
   });
-  const host = process.env.MCP_HOST ?? "127.0.0.1";
-  console.error(`MCP server listening on http://${host}:${port}/mcp (HTTP Stream)`);
-  console.error(`${activeModules.length} modules, ${activeModules.reduce((n, m) => n + m.tools.length, 0)} tools`);
-} else {
-  server.start({ transportType: "stdio" });
 }

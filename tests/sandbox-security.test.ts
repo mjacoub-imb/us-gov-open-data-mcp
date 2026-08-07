@@ -129,6 +129,41 @@ describe("Resource limits", () => {
     expect(result.error).toContain("too large");
     expect(result.stdout).toBe("");
   });
+
+  // Regression test: `runtime.setMemoryLimit()` only bounds QuickJS's own
+  // WASM memory. Before this cap existed, a script logging in a tight loop
+  // grew the `stdout` string on the HOST's heap unbounded — confirmed to
+  // reach ~519MB / RangeError in ~1.1s against the pre-fix build. That's
+  // uncaught by the sandbox's memory limit because the string lives outside
+  // the WASM heap entirely.
+  it("caps host-side stdout accumulation independent of the sandbox memory limit", async () => {
+    const result = await executeInSandbox(
+      SAMPLE_DATA,
+      `const chunk = "x".repeat(100000); for (let i = 0; i < 20000; i++) console.log(chunk);`,
+    );
+    // Must not surface as a script error — output was intentionally capped, not the script failing.
+    expect(result.error).toBeUndefined();
+    // Well under what 20000 * 100000-char lines would produce unbounded (~2GB).
+    expect(Buffer.byteLength(result.stdout, "utf-8")).toBeLessThan(300 * 1024);
+    expect(result.stdout).toContain("truncated");
+  }, 15_000);
+
+  it("limits concurrent sandbox executions instead of running all at once", async () => {
+    // Each execution burns ~its full timeout via a spin loop; if concurrency
+    // weren't capped, all of these would start (and finish) together.
+    const N = 8;
+    const start = Date.now();
+    const results = await Promise.all(
+      Array.from({ length: N }, () =>
+        executeInSandbox(SAMPLE_DATA, `const start = Date.now(); while (Date.now() - start < 300) {}; console.log("done");`),
+      ),
+    );
+    const elapsed = Date.now() - start;
+    expect(results.every(r => r.stdout.trim() === "done")).toBe(true);
+    // With a concurrency cap of 3, 8 executions of ~300ms each queue into at
+    // least 3 sequential batches (~900ms+); fully parallel would finish in ~300ms.
+    expect(elapsed).toBeGreaterThan(600);
+  }, 20_000);
 });
 
 // ─── Prototype pollution ────────────────────────────────────────────
