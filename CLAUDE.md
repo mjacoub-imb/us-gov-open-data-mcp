@@ -119,3 +119,30 @@ The sandbox's `setMemoryLimit(64MB)` only bounds QuickJS's own WASM heap — the
 `server.ts` itself still has no unit tests — it's a top-level script with side effects (module discovery via `readdirSync`/dynamic `import()`, `process.argv` parsing, `server.start()`, `process.exit`), not a set of pure functions. That's why the auth *decisions* were extracted into `src/server/auth.ts` and `src/server/oauth-routes.ts`, which are covered by `tests/auth.test.ts` and `tests/oauth-guards.test.ts`: `resolveAuthConfig` takes `env` as a plain object rather than reading `process.env`, and the guards are exercised against a real Hono app with a stub proxy. Neither uses `vi.mock` — the OAuth delegate and proxy are hand-written objects satisfying an interface, consistent with the repo's no-mocking convention.
 
 What those tests do **not** cover, and which still needs `curl` against a running `dist/server.js`: that the Hono guard routes actually shadow fastmcp's built-in ones (route precedence is a runtime property of fastmcp's request handler), `/health`, `PORT`, `SIGTERM`, and the real Microsoft handshake (which needs a live tenant). Don't assume CI proves the httpStream path end-to-end.
+
+## Project history
+
+### This is a fork, and upstream is still alive
+
+Origin is `mjacoub-imb/us-gov-open-data-mcp`, forked from `lzinga/us-gov-open-data-mcp` (upstream started 2026-02, bulk of the ~80 commits landed 2026-03, tapering since). `main` still contains merge commits from upstream, so upstream merges are an expected event, not a one-off.
+
+**Everything under "Security posture" below exists only in this fork.** None of it has been contributed upstream, so a careless `git merge upstream/main` can silently revert it — the auth block in `server.ts` and `assertPortal` in the socrata SDK are the likeliest conflict sites. After any upstream merge, re-run `npx vitest run` and confirm `tests/auth.test.ts`, `tests/oauth-guards.test.ts`, `tests/socrata-portal-validation.test.ts` and `tests/sandbox-security.test.ts` still pass before pushing.
+
+### Security posture (2026-08)
+
+A deliberate security review ahead of the Railway deployment found that the code was written for a trusted single-user **stdio** deployment while the `Dockerfile` silently reconfigures it as an untrusted multi-user **HTTP** one. Nearly every finding traced to that single mismatch. Two rounds of hardening followed; the *what* is documented in the architecture sections above, this records the *why* so it doesn't get undone:
+
+**PR #1 (merged 2026-08-07)** — four criticals, all confirmed by running code rather than inspection:
+- httpStream had no authentication at all, so deploying would have published ~40 upstream API keys as an open proxy.
+- `code_mode` could grow the Node heap ~519MB in ~1.1s and OOM-kill the process — measured, not theoretical. The sandbox's own 64MB limit doesn't apply because the output string lives on the host heap.
+- `code_mode` bypassed every tool's Zod validation by calling `execute()` directly.
+- Socrata's SSRF denylist admitted `172.16.0.0/12`, `*.railway.internal`, `metadata.google.internal` and octal-encoded loopback, *and* attached `SOCRATA_APP_TOKEN` to whatever host the caller named. Replaced with an allowlist.
+Also: request timeout extended to cover body reads, `Retry-After` capped, API keys removed from the disk cache key, rate-limiter queue bounded, path segments encoded, 9 dependency advisories cleared, container de-rooted.
+
+**PR #2 (open as of 2026-08-08)** — Microsoft Entra ID sign-in, so a team can use per-person identity instead of one shared token. Most of that PR is *not* the OAuth wiring: verification found fastmcp's own OAuth proxy returns the upstream Azure `client_secret` to anonymous callers and never validates `redirect_uri`, so the bulk is the guard routes described above. Worth reporting upstream to fastmcp — those flaws affect every provider it ships, not just Azure.
+
+### Standing constraints
+
+- The static token and Microsoft OAuth are intentionally *both* supported. Don't "simplify" by deleting the static path — it's what Claude Code CLI, scripts and CI use, and it's the fallback if Azure config breaks.
+- Fail-closed on httpStream is deliberate. If a change makes the server start without a credential, that's a regression regardless of what else it fixes.
+- Prefer fixing a class of bug over an instance: the reviews above repeatedly found the same shape (a denylist that fails open, a limit that doesn't bound the thing it appears to). Both `docs/guide/oauth-azure.md` and the architecture notes call out where *not* to trust a library default.
