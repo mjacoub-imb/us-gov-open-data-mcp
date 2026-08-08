@@ -108,6 +108,7 @@ Full documentation at **[lzinga.github.io/us-gov-open-data-mcp](https://lzinga.g
 |---|---|
 | [Getting Started](https://lzinga.github.io/us-gov-open-data-mcp/guide/getting-started) | MCP setup, SDK install, client configs |
 | [API Keys](https://lzinga.github.io/us-gov-open-data-mcp/guide/api-keys) | Which APIs need keys, where to get them |
+| [Microsoft Sign-In](https://lzinga.github.io/us-gov-open-data-mcp/guide/oauth-azure) | Entra ID OAuth for remote/team access over HTTP |
 | [Data Sources](https://lzinga.github.io/us-gov-open-data-mcp/guide/data-sources) | All 40+ APIs grouped by category |
 | [API Reference](https://lzinga.github.io/us-gov-open-data-mcp/api/) | Auto-generated from TypeScript — every function and type |
 | [Examples](https://lzinga.github.io/us-gov-open-data-mcp/guide/sdk-usage) | SDK code, MCP prompts, analysis showcases |

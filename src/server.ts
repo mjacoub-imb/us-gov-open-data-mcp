@@ -27,11 +27,12 @@ import "dotenv/config";
 import { readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { timingSafeEqual } from "crypto";
-import { FastMCP, type Tool, type InputPrompt } from "fastmcp";
+import { FastMCP, AzureProvider, type Tool, type InputPrompt } from "fastmcp";
 import { z } from "zod";
 import { buildInstructions } from "./server/instructions.js";
 import { buildAnalysisPrompts } from "./server/prompts.js";
+import { createAuthenticator, resolveAuthConfig } from "./server/auth.js";
+import { registerOAuthGuards, type OAuthProxyLike } from "./server/oauth-routes.js";
 import { executeInSandbox } from "./shared/sandbox.js";
 import { DOMAINS, type ApiModule } from "./shared/types.js";
 
@@ -175,26 +176,37 @@ for (const mod of activeModules) {
 // The stdio transport is trusted-by-construction (one local process talking
 // to one local client over a pipe). httpStream is not — it's a network
 // listener, and this server holds live API keys for ~40 upstream services.
-// Refuse to expose it without a bearer token: failing open here would let
+// Refuse to expose it without a credential: failing open here would let
 // anyone who finds the URL burn our API quotas and use us as an open proxy.
+//
+// All of the rules live in ./server/auth.ts so they can be unit-tested.
 
-const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+const authResolution = resolveAuthConfig(process.env, transport);
 
-if (transport === "httpStream" && !MCP_AUTH_TOKEN) {
-  console.error(
-    "MCP_AUTH_TOKEN is required when using --transport httpStream (refusing to start unauthenticated on a network listener). " +
-    "Set MCP_AUTH_TOKEN to a long random secret and pass it as a Bearer token or ?token= query param.",
-  );
+if (!authResolution.ok) {
+  // Print every problem at once — one-at-a-time discovery across redeploys is
+  // needlessly slow.
+  console.error("Authentication is misconfigured; refusing to start:\n");
+  for (const err of authResolution.errors) console.error(`  ✗ ${err}`);
+  console.error("");
   process.exit(1);
 }
 
-/** Constant-time string compare — avoids leaking the token via response-timing side channels. */
-function safeTokenEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
-}
+const authConfig = authResolution.config;
+for (const warning of authConfig.warnings) console.warn(`⚠ ${warning}`);
+
+// Only construct the provider when OAuth is actually configured — passing
+// `auth` is what makes FastMCP register the /oauth/* routes at all.
+const azureProvider = authConfig.oauth
+  ? new AzureProvider({
+      baseUrl: authConfig.oauth.publicUrl,
+      clientId: authConfig.oauth.clientId,
+      clientSecret: authConfig.oauth.clientSecret,
+      tenantId: authConfig.oauth.tenantId,
+      ...(authConfig.oauth.encryptionKey && { encryptionKey: authConfig.oauth.encryptionKey }),
+      ...(authConfig.oauth.jwtSigningKey && { jwtSigningKey: authConfig.oauth.jwtSigningKey }),
+    })
+  : undefined;
 
 // ─── Server ──────────────────────────────────────────────────────────
 
@@ -204,21 +216,28 @@ const server = new FastMCP({
   logger,
   instructions: buildInstructions(activeModules),
   health: { enabled: true, path: "/health", message: "ok" },
-  ...(MCP_AUTH_TOKEN && {
-    authenticate: async (request: import("http").IncomingMessage) => {
-      const header = request.headers.authorization ?? "";
-      const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
-      const url = new URL(request.url ?? "", "http://localhost");
-      const queryToken = url.searchParams.get("token") ?? "";
-      const provided = bearer || queryToken;
-
-      if (!provided || !safeTokenEqual(provided, MCP_AUTH_TOKEN)) {
-        throw new Response(null, { status: 401, statusText: "Unauthorized" });
-      }
-      return { authenticated: true };
-    },
+  // Passing `auth` registers the OAuth discovery + /oauth/* routes; passing
+  // `authenticate` alongside it overrides only the per-request check, which
+  // is how both credential types stay usable at once.
+  ...(azureProvider && { auth: azureProvider }),
+  ...(transport === "httpStream" && {
+    authenticate: createAuthenticator({
+      allowQueryToken: authConfig.allowQueryToken,
+      oauthProvider: azureProvider,
+      staticToken: authConfig.staticToken,
+    }),
   }),
 });
+
+// Replace fastmcp's unsafe /oauth/register and /oauth/authorize handlers.
+// Must run before start() so the Hono routes are in place on first request.
+if (azureProvider && authConfig.oauth) {
+  registerOAuthGuards(
+    server.getApp(),
+    azureProvider.getProxy() as unknown as OAuthProxyLike,
+    { redirectAllowlist: authConfig.oauth.redirectAllowlist },
+  );
+}
 
 // ─── Register all module tools + prompts ─────────────────────────────
 
@@ -490,6 +509,18 @@ async function main(): Promise<void> {
     const host = process.env.MCP_HOST ?? "127.0.0.1";
     console.error(`MCP server listening on http://${host}:${port}/mcp (HTTP Stream)`);
     console.error(`Health check: http://${host}:${port}/health`);
+
+    const modes = [
+      authConfig.staticToken ? "static token" : null,
+      authConfig.oauth ? "Microsoft OAuth" : null,
+    ].filter(Boolean);
+    console.error(`Auth: ${modes.join(" + ")}`);
+    if (authConfig.oauth) {
+      // Printed so it can be pasted straight into the App Registration —
+      // an exact-string mismatch here is the most common misconfiguration
+      // and otherwise only surfaces as AADSTS50011 at first login.
+      console.error(`Entra redirect URI (must match App Registration exactly): ${authConfig.oauth.publicUrl}/oauth/callback`);
+    }
     console.error(`${activeModules.length} modules, ${activeModules.reduce((n, m) => n + m.tools.length, 0)} tools`);
   } else {
     await server.start({ transportType: "stdio" });
