@@ -28,6 +28,18 @@ npm run docs:dev        # generate + serve vitepress docs locally
 
 There is no lint step (no ESLint config); CI (`.github/workflows/ci.yml`) only runs `npm run build` and `npm test` on Node 20/22. `tests/**/*.smoke.test.ts` files are excluded from the default `vitest.config.ts` run (none currently exist, but that's the convention for anything that hits live network endpoints instead of pure logic).
 
+## Deployment
+
+A hosted instance runs on Railway (`https://us-gov-open-data-mcp-production.up.railway.app`), built from `main` via the `Dockerfile` and served over `httpStream`. Constraints that aren't visible from the code:
+
+- **Railway never reads `.env`.** It's gitignored and excluded by `.dockerignore`, so the container has no secrets unless they're entered in Railway's own Variables UI. Every API key you want working in production must be copied there by hand — a key present locally will silently be absent in the deployment.
+- **Keep it at one replica.** OAuth login state (`transactions`, `clientCodes`) lives in-process with no sticky sessions, so a second replica breaks logins mid-flow with "Invalid or expired state". The disk cache is also per-replica and per-deploy.
+- **The disk cache is ephemeral here.** `~/.cache/us-gov-open-data-mcp/cache.json` sits on the container's writable layer and is wiped on every deploy, so it never warms across releases.
+- **OAuth sessions don't survive a restart** (in-memory token storage), so each deploy signs every OAuth user out. Setting `MCP_OAUTH_JWT_SIGNING_KEY`/`MCP_OAUTH_ENCRYPTION_KEY` does *not* change this — persisting sessions would need an external store.
+- **Unauthenticated endpoints on the public URL**: `/health`, plus `/ping` and `/ready` (the latter reports live session counts). fastmcp provides no way to disable those two; treat it as accepted minor info disclosure rather than a bug to rediscover.
+
+Verifying a deploy is manual — CI does not exercise the HTTP path at all. `curl /health` should return `ok`, and `/mcp` should return 401 without a credential and 200 with one.
+
 ## Architecture
 
 ### stdio vs. httpStream have different trust models
