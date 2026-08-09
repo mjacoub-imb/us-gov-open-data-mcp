@@ -8,28 +8,53 @@
 import { QUESTION_TYPES, type ApiModule } from "../shared/types.js";
 import { CODE_MODE_GUIDE, RULES } from "./curated-guides.js";
 
+/** Optional shaping of the instructions for the grouped tool surface. */
+export interface InstructionsOptions {
+  /**
+   * Facade tool names per module name (see `src/server/facade.ts`). When
+   * present, the instructions explain that every tool name mentioned below is
+   * an *operation* reached through one of these facades — which is what lets
+   * all the existing `workflow`/`tips`/`crossRef` strings stay valid verbatim.
+   */
+  facadesByModule?: Map<string, string[]>;
+}
+
 /**
  * Build the full MCP instructions string from module metadata.
  *
  * Structure:
+ *   0. Calling convention (grouped tool mode only)
  *   1. Per-module blocks (displayName, description, tools, workflow, tips, auth)
  *   2. Auto-generated cross-reference routing table (from crossRef metadata)
  *   3. Code Mode guide (curated)
  *   4. Rules (curated)
  */
-export function buildInstructions(modules: ApiModule[]): string {
+export function buildInstructions(modules: ApiModule[], options: InstructionsOptions = {}): string {
   const sections: string[] = [];
+  const { facadesByModule } = options;
+
+  // ── Section 0: Grouped-mode calling convention ──
+  if (facadesByModule) sections.push(GROUPED_CALLING_CONVENTION);
 
   // ── Section 1: Per-module blocks ──
   for (const m of modules) {
     const authNote = m.auth
       ? `Requires ${(Array.isArray(m.auth.envVar) ? m.auth.envVar : [m.auth.envVar]).join(", ")}.`
       : "No key required.";
+
+    // In grouped mode the per-module tool list would duplicate what each
+    // facade's own description already carries, so name the facades instead
+    // and let the model read the operation list from the tool itself.
+    const facades = facadesByModule?.get(m.name);
+    const toolsLine = facades
+      ? `Tools: ${facades.join(", ")} (operations below are called through these)`
+      : `Tools: ${m.tools.map((t) => t.name).join(", ")}`;
+
     sections.push(
       [
         `== ${m.displayName.toUpperCase()} ==`,
         m.description,
-        `Tools: ${m.tools.map((t) => t.name).join(", ")}`,
+        toolsLine,
         m.workflow && `Workflow: ${m.workflow}`,
         m.tips,
         authNote,
@@ -48,6 +73,30 @@ export function buildInstructions(modules: ApiModule[]): string {
 
   return sections.join("\n\n");
 }
+
+/**
+ * Explains the facade indirection once, up front.
+ *
+ * Every name in the module blocks and the routing table below (e.g.
+ * `congress_bill_full_profile`) is an operation, not a tool. Stating the
+ * mapping rule here is what keeps ~350 metadata references accurate without
+ * rewriting any of them.
+ */
+const GROUPED_CALLING_CONVENTION = [
+  "== HOW TO CALL THESE TOOLS ==",
+  "This server exposes one tool per data source rather than one tool per operation.",
+  "Every name below that looks like a tool (e.g. congress_search_bills, fda_drug_events, fred_series_data)",
+  "is an OPERATION. Call it through its source's tool:",
+  "",
+  '  congress_bills(operation="congress_search_bills", params={"query":"climate","congress":119})',
+  '  fda_drugs(operation="fda_drug_events", params={"search":"...","limit":50})',
+  '  fred(operation="fred_series_data", params={"series_id":"GDP"})',
+  "",
+  "Each source tool's own description lists the operations it accepts.",
+  'If you are unsure of an operation\'s arguments, call it with describe=true first —',
+  "that returns its full JSON Schema instead of executing it.",
+  "code_mode takes the operation name directly in its `tool` argument (no facade needed).",
+].join("\n");
 
 /**
  * Auto-generate the cross-reference routing table from module `crossRef` metadata.

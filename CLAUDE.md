@@ -20,6 +20,7 @@ node dist/server.js                             # start MCP server (stdio)
 node dist/server.js --list-modules              # list all discovered modules + tool counts
 node dist/server.js --list-modules --json       # same, machine-readable
 node dist/server.js --modules fred,bls,treasury # load only specific modules (faster startup)
+node dist/server.js --tool-mode grouped         # one tool per data source (~52) instead of one per operation (~349)
 node dist/server.js --transport httpStream --port 8080  # HTTP transport instead of stdio (requires MCP_AUTH_TOKEN — see below)
 
 npm run docs:generate   # regenerate docs/*.md from dist/apis (must build first)
@@ -95,6 +96,23 @@ Every SDK calls `createClient({ baseUrl, name, auth?, rateLimit?, cacheTtlMs?, c
 - The rate limiter's wait queue (`TokenBucket`) is capped (`MAX_QUEUE_LENGTH`) so a burst far exceeding the configured rate fails fast instead of accumulating unbounded pending promises
 
 `baseUrl` is fixed at `createClient()` call time — this assumes one module = one fixed API host. The `socrata` module is the exception: it's a multi-tenant platform (each state/city runs its own portal), so it memoizes a `Map<domain, ApiClient>` and validates caller-supplied hostnames (`assertPortal` in `src/apis/socrata/sdk.ts`) before ever calling `createClient` with them, since an unvalidated hostname flowing into `fetch()` from tool input is an SSRF vector. `assertPortal` defaults to a curated allowlist (`STATE_PORTALS`/`CITY_PORTALS`/`FEDERAL_PORTALS`) — a plain hostname denylist isn't sufficient here (it misses whole private ranges, non-IP internal hosts, and encoded IP literals like octal `0177.0.0.1` == `127.0.0.1`). `SOCRATA_ALLOW_ANY_PORTAL=true` opts into reaching portals outside the curated list (with those private-range checks still applied), but `SOCRATA_APP_TOKEN` is only ever attached to a curated (`isKnownPortal`) host — never to a caller-supplied one — so an unlisted/opted-in portal can't exfiltrate the credential. Any future module that talks to a variable/multi-tenant host should follow that pattern (allowlist + no-credential-to-unknown-host) rather than adding dynamic-host support to the shared client.
+
+### Two tool surfaces: `full` and `grouped` (`src/server/facade.ts`)
+
+`TOOL_MODE` / `--tool-mode` selects what the client sees. `full` (default) registers all ~347 module tools individually; `grouped` registers ~52 facades, one per data source, with each underlying tool reachable as an `operation`. Measured over a real MCP handshake: `tools/list` goes from ~348K chars (~87K tokens) to ~113K (~28K). Nothing is removed — this is a packaging change.
+
+Two invariants make it safe to flip on a running deployment, and both are load-bearing:
+
+- **Operation names are the original tool names, byte-for-byte.** All 43 `meta.ts` files' `workflow`/`tips`/`crossRef` strings, and the routing table `instructions.ts` generates from them, reference names like `congress_bill_full_profile`. Preserving the names means none of that metadata changes and none of it goes stale. `instructions.ts` gains one preamble block explaining the facade indirection once, plus a per-module `Tools:` line naming the facades instead of listing operations (the facade's own description already carries the operation list — don't duplicate it).
+- **No tool is silently dropped.** `SPLITS` rules end in a catch-all, so a tool added later still lands in a group. `planFacades` throws at startup if a facade name collides with a real tool name or another facade — fail-closed, same as the auth path.
+
+`congress` (71 tools) and `fda` (25) are split topically via `SPLITS`; every other module is one facade. Split rules are ordered, first-match-wins — `congress_committee_bills` must reach the committee rule before the bill rule sees it, and `tests/facade.test.ts` pins that.
+
+The real cost of grouping is that per-operation parameter schemas leave `tools/list`. `describe: true` is the mitigation, not a nicety: it returns one operation's full JSON Schema via `z.toJSONSchema` on demand. A test asserts every one of the ~347 operations renders a schema, because an operation whose schema can't be rendered is undiscoverable in grouped mode.
+
+`code_mode` is mode-independent — it resolves tools by real name out of `allToolMap`, which is always built from the full set. It and the facades share `validateToolArgs` (both call `execute()` directly, bypassing FastMCP's `CallToolRequestSchema` validation, so both must re-run the schema themselves).
+
+Not done, and the next lever if more headroom is needed: in grouped mode the *instructions* (~68K chars) are now the larger half of the preamble, dominated by the routing table and per-module tips rather than tool names. Also unexplored: fastmcp's per-tool `canAccess(auth)` would allow per-session module filtering on the HTTP transport (`MODULES=` is process-wide), which composes with grouping rather than replacing it.
 
 ### `meta.ts` feeds the LLM-facing instructions, not just docs
 
