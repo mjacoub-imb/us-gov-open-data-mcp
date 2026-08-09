@@ -12,12 +12,16 @@
  *   - stdio transport (default, for VS Code / Claude Desktop / Cursor)
  *   - HTTP Stream transport (for web apps, remote access)
  *   - Selective module loading (load only what you need)
+ *   - Two tool surfaces: `full` (one tool per operation) and `grouped`
+ *     (one tool per data source) — see ./server/facade.ts
  *
  * Usage:
  *   node dist/server.js                                   # stdio (default)
  *   node dist/server.js --transport httpStream --port 8080 # HTTP on port 8080
  *   MODULES=fred,bls,treasury node dist/server.js         # load only 3 modules
  *   node dist/server.js --modules fred,bls,treasury       # same via CLI flag
+ *   node dist/server.js --tool-mode grouped               # ~47 source tools instead of ~347
+ *   TOOL_MODE=grouped node dist/server.js                 # same via env
  *   node dist/server.js --list-modules                    # list all modules grouped by domain and exit
  *   node dist/server.js --list                            # alias for --list-modules
  *   node dist/server.js --list-modules --json             # same, as JSON (for scripting)
@@ -33,6 +37,14 @@ import { buildInstructions } from "./server/instructions.js";
 import { buildAnalysisPrompts } from "./server/prompts.js";
 import { createAuthenticator, resolveAuthConfig } from "./server/auth.js";
 import { registerOAuthGuards, type OAuthProxyLike } from "./server/oauth-routes.js";
+import {
+  TOOL_MODES,
+  buildFacadeTool,
+  facadeNamesByModule,
+  planFacades,
+  validateToolArgs,
+  type ToolMode,
+} from "./server/facade.js";
 import { executeInSandbox } from "./shared/sandbox.js";
 import { DOMAINS, type ApiModule } from "./shared/types.js";
 
@@ -88,10 +100,18 @@ function parseArgs() {
   const modulesFilter = get("--modules") ?? process.env.MODULES;
   const listModules = args.includes("--list-modules") || args.includes("--list");
 
-  return { transport, port, modulesFilter, listModules };
+  // `full` stays the default: stdio clients are local and context-cheap, and
+  // existing configs/scripts reference individual tool names.
+  const toolMode = (get("--tool-mode") ?? process.env.TOOL_MODE ?? "full") as ToolMode;
+  if (!TOOL_MODES.includes(toolMode)) {
+    console.error(`Invalid tool mode "${toolMode}". Valid modes: ${TOOL_MODES.join(", ")}`);
+    process.exit(1);
+  }
+
+  return { transport, port, modulesFilter, listModules, toolMode };
 }
 
-const { transport, port, modulesFilter, listModules } = parseArgs();
+const { transport, port, modulesFilter, listModules, toolMode } = parseArgs();
 
 if (listModules) {
   const asJson = process.argv.includes("--json");
@@ -171,6 +191,19 @@ for (const mod of activeModules) {
   }
 }
 
+// ─── Tool surface ────────────────────────────────────────────────────
+//
+// `full` registers every module tool individually (~347 tools). `grouped`
+// registers one facade per data source (~47), with each underlying tool
+// reachable as an `operation` under its original name. The full surface costs
+// ~75k tokens of JSON Schema on every tools/list; grouped costs ~15k.
+//
+// This is a surface change only — no capability is added or removed, and
+// `code_mode` reaches all underlying tools by name in either mode.
+
+const facadeGroups = toolMode === "grouped" ? planFacades(activeModules) : [];
+const facadesByModule = toolMode === "grouped" ? facadeNamesByModule(facadeGroups) : undefined;
+
 // ─── HTTP transport auth ──────────────────────────────────────────────
 //
 // The stdio transport is trusted-by-construction (one local process talking
@@ -214,7 +247,7 @@ const server = new FastMCP({
   name: "US Government Open Data",
   version: "2.0.0",
   logger,
-  instructions: buildInstructions(activeModules),
+  instructions: buildInstructions(activeModules, { facadesByModule }),
   health: { enabled: true, path: "/health", message: "ok" },
   // Passing `auth` registers the OAuth discovery + /oauth/* routes; passing
   // `authenticate` alongside it overrides only the per-request check, which
@@ -256,12 +289,21 @@ const DEFAULT_TOOL_ANNOTATIONS = {
   destructiveHint: false,
 } as const;
 
-for (const mod of activeModules) {
-  const annotated = mod.tools.map(t => ({
+const registeredTools =
+  toolMode === "grouped"
+    ? facadeGroups.map(buildFacadeTool)
+    : activeModules.flatMap(mod => mod.tools);
+
+server.addTools(
+  registeredTools.map(t => ({
     ...t,
     annotations: { ...DEFAULT_TOOL_ANNOTATIONS, ...(t.annotations ?? {}) },
-  }));
-  server.addTools(annotated as any);
+  })) as any,
+);
+
+// Prompts are unaffected by the tool surface — they reference operations by
+// their original names, which stay valid in both modes.
+for (const mod of activeModules) {
   if (mod.prompts?.length) server.addPrompts(mod.prompts as any);
 }
 
@@ -311,13 +353,18 @@ const TOOL_ALIASES: Record<string, string> = {
   // "fda_search_events": "fda_drug_events",
 };
 
-// Build a lookup map of all registered tools for code_mode to call.
+// Build a lookup map of every underlying tool for code_mode to call — always
+// the full set, independent of the tool surface: in grouped mode the facades
+// are what the client sees, but code_mode still addresses operations by their
+// real names.
+//
 // Keep the schema alongside execute — code_mode calls execute() directly,
 // bypassing the framework's own CallToolRequestSchema handler (and the
 // "~standard".validate() step it normally runs before invoking a tool), so
-// code_mode has to replicate that validation itself or every tool's Zod
-// schema — enum constraints, numeric bounds, format checks — becomes
-// unenforced for any call routed through here.
+// code_mode has to replicate that validation itself (via `validateToolArgs`,
+// shared with the facades) or every tool's Zod schema — enum constraints,
+// numeric bounds, format checks — becomes unenforced for any call routed
+// through here.
 interface RegisteredTool {
   parameters?: { "~standard": { validate: (value: unknown) => Promise<{ value: unknown; issues?: readonly { path?: readonly (string | number)[]; message: string }[] }> } };
   execute: (args: Record<string, unknown>, context: unknown) => Promise<unknown>;
@@ -377,17 +424,9 @@ server.addTool({
     // Validate tool_args against the target tool's own schema — the same
     // check FastMCP's normal CallToolRequestSchema handler runs, which this
     // direct execute() call would otherwise skip entirely.
-    let validatedArgs: Record<string, unknown> = toolArgs ?? {};
-    if (registered.parameters) {
-      const parsed = await registered.parameters["~standard"].validate(toolArgs ?? {});
-      if (parsed.issues) {
-        const friendly = parsed.issues
-          .map(issue => `${issue.path?.join(".") || "root"}: ${issue.message}`)
-          .join(", ");
-        return `Error: invalid tool_args for '${resolvedName}': ${friendly}`;
-      }
-      validatedArgs = parsed.value as Record<string, unknown>;
-    }
+    const validated = await validateToolArgs(registered, toolArgs ?? {}, resolvedName, "tool_args");
+    if ("error" in validated) return validated.error;
+    const validatedArgs = validated.value;
 
     await reportProgress({ progress: 0, total: 2 });
 
@@ -451,6 +490,12 @@ server.addResource({
 
     let md = `# US Government Open Data — API Reference\n\n`;
     md += `**${activeModules.length} APIs loaded** · ${noKey.length} require no key · ${configuredKeys.length}/${Object.keys(keyGroups).length} API keys configured\n\n`;
+
+    if (toolMode === "grouped") {
+      md += `> **Grouped tool mode.** The tool names listed below are *operations*. Call them through their `;
+      md += `source tool, e.g. \`congress_bills(operation="congress_search_bills", params={...})\`. `;
+      md += `Pass \`describe=true\` to get an operation's JSON Schema.\n\n`;
+    }
 
     // Status section
     if (missingKeys.length) {
@@ -521,7 +566,12 @@ async function main(): Promise<void> {
       // and otherwise only surfaces as AADSTS50011 at first login.
       console.error(`Entra redirect URI (must match App Registration exactly): ${authConfig.oauth.publicUrl}/oauth/callback`);
     }
-    console.error(`${activeModules.length} modules, ${activeModules.reduce((n, m) => n + m.tools.length, 0)} tools`);
+    const operationCount = activeModules.reduce((n, m) => n + m.tools.length, 0);
+    console.error(
+      toolMode === "grouped"
+        ? `${activeModules.length} modules, ${registeredTools.length} source tools exposing ${operationCount} operations (tool-mode: grouped)`
+        : `${activeModules.length} modules, ${operationCount} tools (tool-mode: full)`,
+    );
   } else {
     await server.start({ transportType: "stdio" });
   }

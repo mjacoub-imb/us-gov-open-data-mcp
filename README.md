@@ -24,6 +24,7 @@
 - **Cross-referencing** — built-in instructions guide the LLM to combine data from multiple agencies (e.g., FDA adverse events + lobbying spend + campaign contributions)
 - **Code mode** — WASM-sandboxed JavaScript execution reduces context window usage by 98-100% for large responses
 - **Selective loading** — load only the modules you need: `--modules fred,treasury,congress`
+- **Grouped tool mode** — `--tool-mode grouped` collapses 347 tools into 52 source-level tools (~87K → ~28K tokens of schema) with every operation still reachable
 - **Dual transport** — stdio for desktop clients, HTTP Stream for web/remote
 - **TypeScript SDK** — every API is importable as a standalone typed client, no MCP required
 - **Disk-backed caching** — responses cached to disk, survives restarts

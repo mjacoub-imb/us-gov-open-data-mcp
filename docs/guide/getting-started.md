@@ -68,6 +68,48 @@ node dist/server.js --transport httpStream --port 8080
 
 Endpoint: `http://localhost:8080/mcp`
 
+### Grouped Tool Mode
+
+The default surface is one tool per operation — 347 tools, about 87K tokens of JSON Schema on every `tools/list`. Grouped mode collapses that to one tool per data source:
+
+```bash
+# CLI flag
+node dist/server.js --tool-mode grouped
+
+# Environment variable
+TOOL_MODE=grouped node dist/server.js
+```
+
+| Mode | Tools | `tools/list` payload |
+|---|---|---|
+| `full` (default) | 349 | ~87K tokens |
+| `grouped` | 52 | ~28K tokens |
+
+Nothing is removed. Each original tool becomes an **operation** on its source's tool, under the exact same name:
+
+```js
+// full mode
+congress_search_bills({ query: "climate", congress: 119 })
+
+// grouped mode — same operation, same arguments
+congress_bills({ operation: "congress_search_bills", params: { query: "climate", congress: 119 } })
+```
+
+Because operation names are unchanged, every workflow hint, tip and cross-reference in the instructions stays accurate in both modes.
+
+The tradeoff is that per-operation parameter schemas no longer appear in `tools/list`. Pass `describe: true` to get one back on demand:
+
+```js
+congress_bills({ operation: "congress_bill_details", describe: true })
+// → { operation, description, params: <full JSON Schema> }
+```
+
+Two large sources are split along topical lines rather than exposed as a single unwieldy tool — `congress` into `congress_bills`, `congress_members`, `congress_committee_activity`, `congress_nominations_and_treaties` and `congress_records`; `fda` into `fda_drugs`, `fda_devices`, `fda_food_safety` and `fda_reference`.
+
+`code_mode` is unaffected by the mode and still addresses every operation by its own name.
+
+Recommended: `full` for stdio (local, one client, context is cheap), `grouped` for hosted HTTP deployments serving many clients.
+
 ### Selective Module Loading
 
 Load only the modules you need — reduces startup time and context window usage:
