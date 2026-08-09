@@ -15,7 +15,14 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { assertPortal, isKnownPortal, soqlEscape } from "../src/apis/socrata/sdk.js";
+import {
+  assertPortal,
+  isKnownPortal,
+  MAX_PORTAL_CLIENTS,
+  portal,
+  portalPoolSize,
+  soqlEscape,
+} from "../src/apis/socrata/sdk.js";
 
 afterEach(() => {
   delete process.env.SOCRATA_ALLOW_ANY_PORTAL;
@@ -99,6 +106,31 @@ describe("socrata: assertPortal bypass regressions (SOCRATA_ALLOW_ANY_PORTAL=tru
 
   it("rejects non-curated portals by default even without the opt-in", () => {
     expect(() => assertPortal("data.arizona.gov")).toThrow();
+  });
+});
+
+describe("socrata: portal client pool bound (SOCRATA_ALLOW_ANY_PORTAL=true)", () => {
+  // `portal()` builds an ApiClient (and, via createClient, a disk-cache
+  // namespace) per distinct hostname. createClient() itself does no network
+  // I/O — the client only calls out on .get()/.getText()/.post(), which this
+  // test never does — so exercising the real pool here stays network-free.
+  it("never grows the pool past MAX_PORTAL_CLIENTS regardless of how many distinct hosts are requested", () => {
+    process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
+    for (let i = 0; i < MAX_PORTAL_CLIENTS + 25; i++) {
+      portal(`pool-test-${i}.example.com`);
+    }
+    expect(portalPoolSize()).toBeLessThanOrEqual(MAX_PORTAL_CLIENTS);
+  });
+
+  it("evicts an old entry rather than refusing new portals once at capacity", () => {
+    process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
+    for (let i = 0; i < MAX_PORTAL_CLIENTS + 10; i++) {
+      portal(`pool-fill-${i}.example.com`);
+    }
+    // The pool is at (or was already trimmed to) capacity; requesting one
+    // more distinct host must still succeed by evicting, not throw or hang.
+    expect(() => portal("pool-fill-one-more.example.com")).not.toThrow();
+    expect(portalPoolSize()).toBeLessThanOrEqual(MAX_PORTAL_CLIENTS);
   });
 });
 

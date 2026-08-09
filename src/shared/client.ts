@@ -524,6 +524,33 @@ function truncateBody(body: string, max = 300): string {
   return body.slice(0, max) + `… (truncated, ${body.length} chars total)`;
 }
 
+// ─── URL building ──────────────────────────────────────────────────────
+
+/**
+ * Serialize params into `key=value` query fragments.
+ * Supports string, number, and string[] (repeated keys, e.g. `facets[series][]`).
+ * Keys are NOT encoded — preserves bracket syntax like `page[number]`.
+ */
+function serializeParams(params?: Params): string[] {
+  if (!params) return [];
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === "") continue;
+    if (Array.isArray(v)) {
+      for (const item of v) parts.push(`${k}=${encodeURIComponent(String(item))}`);
+    } else {
+      parts.push(`${k}=${encodeURIComponent(String(v))}`);
+    }
+  }
+  return parts;
+}
+
+/** Join a base URL, path, and pre-built query fragments into a full URL. */
+function joinUrl(baseUrl: string, path: string, parts: string[]): string {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return parts.length ? `${baseUrl}${p}?${parts.join("&")}` : `${baseUrl}${p}`;
+}
+
 // ─── Client Factory ──────────────────────────────────────────────────
 
 export function createClient(config: ClientConfig): ApiClient {
@@ -573,21 +600,8 @@ export function createClient(config: ClientConfig): ApiClient {
       }
     }
 
-    // User params — supports string, number, and string[] (repeated keys)
-    // Keys are NOT encoded — preserves bracket syntax like page[number], facets[series][]
-    if (params) {
-      for (const [k, v] of Object.entries(params)) {
-        if (v === undefined || v === "") continue;
-        if (Array.isArray(v)) {
-          for (const item of v) parts.push(`${k}=${encodeURIComponent(String(item))}`);
-        } else {
-          parts.push(`${k}=${encodeURIComponent(String(v))}`);
-        }
-      }
-    }
-
-    const p = path.startsWith("/") ? path : `/${path}`;
-    return parts.length ? `${baseUrl}${p}?${parts.join("&")}` : `${baseUrl}${p}`;
+    parts.push(...serializeParams(params));
+    return joinUrl(baseUrl, path, parts);
   }
 
   /**
@@ -598,19 +612,7 @@ export function createClient(config: ClientConfig): ApiClient {
    * otherwise persist secrets in plaintext.
    */
   function buildCacheKeyUrl(path: string, params?: Params): string {
-    const parts: string[] = [];
-    if (params) {
-      for (const [k, v] of Object.entries(params)) {
-        if (v === undefined || v === "") continue;
-        if (Array.isArray(v)) {
-          for (const item of v) parts.push(`${k}=${encodeURIComponent(String(item))}`);
-        } else {
-          parts.push(`${k}=${encodeURIComponent(String(v))}`);
-        }
-      }
-    }
-    const p = path.startsWith("/") ? path : `/${path}`;
-    return parts.length ? `${baseUrl}${p}?${parts.join("&")}` : `${baseUrl}${p}`;
+    return joinUrl(baseUrl, path, serializeParams(params));
   }
 
   function buildHeaders(extra?: Record<string, string>): Record<string, string> {

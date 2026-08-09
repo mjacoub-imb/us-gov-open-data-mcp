@@ -189,12 +189,44 @@ export function soqlEscape(value: string | number): string {
 
 // ─── Per-portal client pool ──────────────────────────────────────────────
 
+/**
+ * Max distinct portal hostnames pooled at once. Comfortably above the ~25
+ * curated portals (STATE_PORTALS + CITY_PORTALS + FEDERAL_PORTALS), so normal
+ * usage never evicts anything. Exists for SOCRATA_ALLOW_ANY_PORTAL: without a
+ * cap, a caller varying the `domain` argument across many distinct hostnames
+ * would grow this Map — and, via createClient's disk-cache namespace per
+ * `name`, a same-shaped cache.json namespace per hostname — without bound.
+ */
+export const MAX_PORTAL_CLIENTS = 100;
+
 const portalClients = new Map<string, ApiClient>();
 
-function portal(domain: string): ApiClient {
+/** Exposed for tests/socrata-portal-validation.test.ts (pool-bound + eviction coverage). */
+export function portalPoolSize(): number {
+  return portalClients.size;
+}
+
+export function portal(domain: string): ApiClient {
   const d = assertPortal(domain);
   let client = portalClients.get(d);
   if (!client) {
+    if (portalClients.size >= MAX_PORTAL_CLIENTS) {
+      // Map preserves insertion order, so the first key is the
+      // longest-untouched entry (`portalClients.delete`+`.set` on repeat
+      // access would make this a true LRU, but this pool sees traffic
+      // concentrated on the curated portals that stay well under the cap —
+      // eviction only fires under sustained use of many distinct
+      // SOCRATA_ALLOW_ANY_PORTAL hosts, where "oldest inserted" is an
+      // adequate proxy for "least likely still in use"). Clear its disk
+      // cache too, not just the in-memory client wrapper — otherwise the
+      // per-portal cache.json namespace outlives the pool eviction and the
+      // Map cap doesn't actually bound the memory it exists to bound.
+      const oldest = portalClients.keys().next().value;
+      if (oldest !== undefined) {
+        portalClients.get(oldest)?.clearCache();
+        portalClients.delete(oldest);
+      }
+    }
     client = createClient({
       baseUrl: `https://${d}`,
       name: `socrata:${d}`,

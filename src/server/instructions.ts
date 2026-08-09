@@ -17,6 +17,21 @@ export interface InstructionsOptions {
    * all the existing `workflow`/`tips`/`crossRef` strings stay valid verbatim.
    */
   facadesByModule?: Map<string, string[]>;
+  /**
+   * Real operation names actually reachable through a surviving facade, per
+   * module (see `exposedOperationsByModule` in `src/server/facade.ts`).
+   *
+   * Only meaningful alongside `facadesByModule`, and only differs from "every
+   * tool the module has" when `FACADES`/`FACADES_EXCLUDE` has trimmed the
+   * surface below module granularity. A module's `workflow`/`tips`/`crossRef`
+   * strings name specific operations by their original tool name — if
+   * `FACADES_EXCLUDE` drops the facade one of those operations lives in, the
+   * text still names it, but no registered tool can reach it anymore except
+   * `code_mode`. Without this, the model is told an operation is callable
+   * through a facade that in fact doesn't expose it, and only discovers that
+   * by trying and getting a schema-validation error.
+   */
+  exposedOpsByModule?: Map<string, Set<string>>;
 }
 
 /**
@@ -31,7 +46,7 @@ export interface InstructionsOptions {
  */
 export function buildInstructions(modules: ApiModule[], options: InstructionsOptions = {}): string {
   const sections: string[] = [];
-  const { facadesByModule } = options;
+  const { facadesByModule, exposedOpsByModule } = options;
 
   // ── Section 0: Grouped-mode calling convention ──
   if (facadesByModule) sections.push(GROUPED_CALLING_CONVENTION);
@@ -45,16 +60,40 @@ export function buildInstructions(modules: ApiModule[], options: InstructionsOpt
     // In grouped mode the per-module tool list would duplicate what each
     // facade's own description already carries, so name the facades instead
     // and let the model read the operation list from the tool itself.
+    //
+    // A module can have grouped mode active but zero surviving facades (every
+    // one of its facades dropped by FACADES_EXCLUDE) — `facades` is undefined
+    // in that case, NOT because grouped mode is off. Falling back to the
+    // full-mode line here would print every one of the module's tool names as
+    // if they were directly callable tools, when in fact none of them are
+    // registered as anything at all in this deployment.
     const facades = facadesByModule?.get(m.name);
-    const toolsLine = facades
-      ? `Tools: ${facades.join(", ")} (operations below are called through these)`
-      : `Tools: ${m.tools.map((t) => t.name).join(", ")}`;
+    const toolsLine = !facadesByModule
+      ? `Tools: ${m.tools.map((t) => t.name).join(", ")}`
+      : facades
+        ? `Tools: ${facades.join(", ")} (operations below are called through these)`
+        : `Tools: none registered in this deployment. These ${m.tools.length} operations are reachable only via ` +
+          `code_mode(tool="<name>", ...): ${m.tools.map((t) => t.name).join(", ")}`;
+
+    // Even when some facades survive, FACADES_EXCLUDE can drop others — the
+    // module's workflow/tips/crossRef text below still names their operations
+    // by original tool name (that's the whole point of the facade design),
+    // but no registered facade can reach them anymore. Name the gap instead
+    // of letting the model discover it by getting a schema-validation error.
+    const exposedOps = exposedOpsByModule?.get(m.name);
+    const hiddenOps = facades && exposedOps
+      ? m.tools.map((t) => t.name).filter((name) => !exposedOps.has(name))
+      : [];
+    const hiddenOpsNote = hiddenOps.length
+      ? `Not exposed as operations in this deployment — reachable only via code_mode(tool="<name>", ...): ${hiddenOps.join(", ")}`
+      : "";
 
     sections.push(
       [
         `== ${m.displayName.toUpperCase()} ==`,
         m.description,
         toolsLine,
+        hiddenOpsNote,
         m.workflow && `Workflow: ${m.workflow}`,
         m.tips,
         authNote,

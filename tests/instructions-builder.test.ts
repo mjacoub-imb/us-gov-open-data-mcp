@@ -133,6 +133,81 @@ describe("buildInstructions", () => {
   });
 });
 
+// ─── Grouped mode: facadesByModule / exposedOpsByModule ───────────────
+//
+// Regression coverage for the bug where FACADES_EXCLUDE trimmed the
+// registered tool surface but buildInstructions kept advertising every
+// module's original tool names as directly callable — verified live against
+// the production Dockerfile config, where the instructions told the model to
+// call operations no registered facade could reach.
+
+describe("buildInstructions — grouped mode with a partially trimmed module", () => {
+  it("names only the surviving facade on the Tools: line, not raw tool names", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map([["test-mod", ["test_mod_facade"]]]),
+      exposedOpsByModule: new Map([["test-mod", new Set(["test_search", "test_data"])]]),
+    });
+    expect(result).toContain("Tools: test_mod_facade (operations below are called through these)");
+  });
+
+  it("lists operations hidden by FACADES_EXCLUDE and points them at code_mode", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map([["test-mod", ["test_mod_facade"]]]),
+      // Only test_search survived; test_data's facade was excluded.
+      exposedOpsByModule: new Map([["test-mod", new Set(["test_search"])]]),
+    });
+    expect(result).toContain("Not exposed as operations in this deployment");
+    expect(result).toContain("code_mode");
+    expect(result).toContain("test_data");
+    // The surviving operation must not be listed as hidden.
+    const hiddenLine = result.split("\n").find(l => l.includes("Not exposed as operations"));
+    expect(hiddenLine).toBeDefined();
+    expect(hiddenLine).not.toContain("test_search");
+  });
+
+  it("adds no hidden-operations note when every operation survives", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map([["test-mod", ["test_mod_facade"]]]),
+      exposedOpsByModule: new Map([["test-mod", new Set(["test_search", "test_data"])]]),
+    });
+    expect(result).not.toContain("Not exposed as operations");
+  });
+});
+
+describe("buildInstructions — grouped mode with a module fully excluded (every facade dropped)", () => {
+  it("does not fall back to the full-mode Tools: line implying the tools are directly callable", () => {
+    const mod = mockModule();
+    // facadesByModule has no entry for "test-mod" at all — every one of its
+    // facades was excluded, distinct from grouped mode being off.
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map(),
+      exposedOpsByModule: new Map(),
+    });
+    // The bug: this used to render exactly "Tools: test_search, test_data",
+    // identical to full (ungrouped) mode's line — implying both names are
+    // directly callable tools, when in this deployment neither is registered
+    // as anything.
+    expect(result).not.toContain("Tools: test_search, test_data");
+    expect(result).toContain("none registered in this deployment");
+    expect(result).toContain("code_mode");
+    expect(result).toContain("test_search");
+    expect(result).toContain("test_data");
+  });
+});
+
+describe("buildInstructions — full mode (no facadesByModule) is unaffected", () => {
+  it("still lists raw tool names directly, with no hidden-operations note", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod]);
+    expect(result).toContain("Tools: test_search, test_data");
+    expect(result).not.toContain("Not exposed as operations");
+    expect(result).not.toContain("none registered in this deployment");
+  });
+});
+
 // ─── buildAnalysisPrompts ─────────────────────────────────────────────
 
 describe("buildAnalysisPrompts", () => {

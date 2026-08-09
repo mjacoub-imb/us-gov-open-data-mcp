@@ -152,3 +152,20 @@ export interface ApiModule extends ModuleMeta {
   /** Clear cached API responses. */
   clearCache?: () => void;
 }
+
+/**
+ * Default tool annotations shared by every registered-tool surface
+ * (module tools in `server.ts`, `code_mode`, and grouped-mode facades in
+ * `server/facade.ts`).
+ *
+ * All government data tools are read-only fetches against external APIs that
+ * are safe to retry with identical args (data is published, not user-driven),
+ * so they're idempotent and openWorld by default. Per-tool annotations
+ * (e.g. `title`) are preserved via spread at each call site.
+ */
+export const DEFAULT_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  idempotentHint: true,
+  openWorldHint: true,
+  destructiveHint: false,
+} as const;

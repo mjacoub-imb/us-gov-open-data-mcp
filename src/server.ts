@@ -43,14 +43,16 @@ import { createAuthenticator, resolveAuthConfig } from "./server/auth.js";
 import { registerOAuthGuards, type OAuthProxyLike } from "./server/oauth-routes.js";
 import {
   TOOL_MODES,
+  applyFacadeFilter,
   buildFacadeTool,
+  exposedOperationsByModule,
   facadeNamesByModule,
   planFacades,
   validateToolArgs,
   type ToolMode,
 } from "./server/facade.js";
 import { executeInSandbox } from "./shared/sandbox.js";
-import { DOMAINS, type ApiModule } from "./shared/types.js";
+import { DEFAULT_TOOL_ANNOTATIONS, DOMAINS, type ApiModule } from "./shared/types.js";
 
 const logger = {
   ...console,
@@ -106,6 +108,21 @@ function parseArgs() {
   // facades, and a deployment often wants only one of them (e.g. congress_bills
   // for legislation tracking, without members/committees/nominations/records).
   // MODULES cannot express that — it is all-or-nothing per module.
+  //
+  // `get()` returns undefined both when the flag is absent AND when it's the
+  // last argument with no value after it — the two are indistinguishable
+  // without also checking `args.includes(flag)`, which is why that check
+  // happens for these two flags below. Without it, `--facades` given with no
+  // value would silently apply no filter and register every facade, the
+  // opposite of what an operator invoking it clearly intended.
+  if (args.includes("--facades") && get("--facades") === undefined) {
+    console.error("--facades requires a value (comma-separated facade names).");
+    process.exit(1);
+  }
+  if (args.includes("--facades-exclude") && get("--facades-exclude") === undefined) {
+    console.error("--facades-exclude requires a value (comma-separated facade names).");
+    process.exit(1);
+  }
   const facadesFilter = get("--facades") ?? process.env.FACADES;
   // Dropping 4 of 22 facades should read as dropping 4, not as re-listing 18 —
   // and an allowlist silently hides any facade added later.
@@ -228,39 +245,28 @@ for (const mod of activeModules) {
 let facadeGroups = toolMode === "grouped" ? planFacades(activeModules) : [];
 
 // FACADES trims the grouped surface below module granularity. Applied *before*
-// facadeNamesByModule so the generated instructions advertise only what is
-// actually registered — otherwise the routing table names facades the client
-// cannot call. Note this drops those operations from tools/list only; they stay
-// reachable by name through `code_mode`, which resolves out of `allToolMap`
-// (built from activeModules) and costs no tools/list bytes.
+// facadeNamesByModule/exposedOperationsByModule so the generated instructions
+// advertise only what is actually registered. Note this drops those operations
+// from tools/list only; they stay reachable by name through `code_mode`, which
+// resolves out of `allToolMap` (built from activeModules) and costs no
+// tools/list bytes. See applyFacadeFilter in server/facade.ts for the decision
+// logic and its unit tests.
 if (facadesFilter || facadesExclude) {
-  const spec = (facadesFilter ?? facadesExclude)!;
-  const keepOnly = Boolean(facadesFilter);
-  const named = new Set(spec.split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
-  const available = facadeGroups.map(g => g.name);
-
-  // A name matching nothing is a typo or a stale config naming a facade whose
-  // module MODULES no longer loads. Either way the operator's intent is not
-  // what the server would serve, so fail closed instead of quietly diverging.
-  const unmatched = [...named].filter(w => !available.some(a => a.toLowerCase() === w));
-  if (unmatched.length > 0) {
-    console.error(`Unknown facade(s): ${unmatched.join(", ")}. Available: ${available.join(", ")}`);
+  const result = applyFacadeFilter(facadeGroups, { keep: facadesFilter, exclude: facadesExclude });
+  if ("error" in result) {
+    console.error(result.error);
     process.exit(1);
   }
-
-  const kept = facadeGroups.filter(g => named.has(g.name.toLowerCase()) === keepOnly);
-
-  if (kept.length === 0) {
-    console.error(`No facades left after applying "${spec}". Available: ${available.join(", ")}`);
-    process.exit(1);
-  }
-
-  const dropped = facadeGroups.length - kept.length;
-  console.error(`Loaded ${kept.length}/${facadeGroups.length} facades (dropped ${dropped}): ${kept.map(g => g.name).join(", ")}`);
-  facadeGroups = kept;
+  if (result.message) console.error(result.message);
+  facadeGroups = result.kept;
 }
 
 const facadesByModule = toolMode === "grouped" ? facadeNamesByModule(facadeGroups) : undefined;
+// Which real operation names are actually reachable through a surviving
+// facade, per module — lets buildInstructions tell the model exactly which
+// workflow/tips/crossRef-mentioned operations require `code_mode` in this
+// deployment, instead of advertising all of them as directly callable.
+const exposedOpsByModule = toolMode === "grouped" ? exposedOperationsByModule(facadeGroups) : undefined;
 
 // ─── HTTP transport auth ──────────────────────────────────────────────
 //
@@ -305,7 +311,7 @@ const server = new FastMCP({
   name: "US Government Open Data",
   version: "2.0.0",
   logger,
-  instructions: buildInstructions(activeModules, { facadesByModule }),
+  instructions: buildInstructions(activeModules, { facadesByModule, exposedOpsByModule }),
   health: { enabled: true, path: "/health", message: "ok" },
   // Passing `auth` registers the OAuth discovery + /oauth/* routes; passing
   // `authenticate` alongside it overrides only the per-request check, which
@@ -331,21 +337,6 @@ if (azureProvider && authConfig.oauth) {
 }
 
 // ─── Register all module tools + prompts ─────────────────────────────
-
-/**
- * Default tool annotations applied to every module tool.
- *
- * All government data tools are read-only fetches against external APIs that
- * are safe to retry with identical args (data is published, not user-driven),
- * so they're idempotent and openWorld by default. Per-tool annotations
- * (e.g. `title`) are preserved via spread.
- */
-const DEFAULT_TOOL_ANNOTATIONS = {
-  readOnlyHint: true,
-  idempotentHint: true,
-  openWorldHint: true,
-  destructiveHint: false,
-} as const;
 
 const registeredTools =
   toolMode === "grouped"
@@ -451,10 +442,7 @@ server.addTool({
     "       'Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,10).forEach(([k,v])=>console.log(k+\": \"+v))'",
   annotations: {
     title: "Code Mode: Process Tool Output",
-    readOnlyHint: true,
-    idempotentHint: true,
-    openWorldHint: true,
-    destructiveHint: false,
+    ...DEFAULT_TOOL_ANNOTATIONS,
   },
   parameters: z.object({
     tool: z.string().describe(

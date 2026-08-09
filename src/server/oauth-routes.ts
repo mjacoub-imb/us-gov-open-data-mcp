@@ -58,6 +58,12 @@ function oauthError(error: string, description: string, status = 400): Response 
   });
 }
 
+/** Pull a numeric `statusCode` off a thrown error, falling back when absent or non-numeric. */
+function statusFrom(err: unknown, fallback = 400): number {
+  const status = (err as { statusCode?: unknown })?.statusCode;
+  return typeof status === "number" ? status : fallback;
+}
+
 /**
  * Register hardened /oauth/register and /oauth/authorize handlers.
  *
@@ -104,10 +110,7 @@ export function registerOAuthGuards(
     try {
       registration = await proxy.registerClient(body);
     } catch (err) {
-      const status = typeof (err as { statusCode?: number })?.statusCode === "number"
-        ? (err as { statusCode: number }).statusCode
-        : 400;
-      return oauthError("invalid_client_metadata", (err as Error)?.message ?? "Registration failed.", status);
+      return oauthError("invalid_client_metadata", (err as Error)?.message ?? "Registration failed.", statusFrom(err));
     }
 
     // The whole point of this shim: never return the upstream app's secret.
@@ -162,13 +165,10 @@ export function registerOAuthGuards(
         },
       );
     } catch (err) {
-      const status = typeof (err as { statusCode?: number })?.statusCode === "number"
-        ? (err as { statusCode: number }).statusCode
-        : 400;
       return oauthError(
         (err as { code?: string })?.code ?? "invalid_request",
         (err as Error)?.message ?? "Authorization failed.",
-        status,
+        statusFrom(err),
       );
     }
   });
