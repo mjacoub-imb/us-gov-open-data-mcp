@@ -58,6 +58,7 @@ export default withMermaid(defineConfig({
           items: [
             { text: "Quick Start", link: "/guide/getting-started" },
             { text: "API Keys", link: "/guide/api-keys" },
+            { text: "Microsoft Sign-In", link: "/guide/oauth-azure" },
             {
               text: "Data Sources",
               link: "/guide/data-sources",

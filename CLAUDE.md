@@ -28,11 +28,41 @@ npm run docs:dev        # generate + serve vitepress docs locally
 
 There is no lint step (no ESLint config); CI (`.github/workflows/ci.yml`) only runs `npm run build` and `npm test` on Node 20/22. `tests/**/*.smoke.test.ts` files are excluded from the default `vitest.config.ts` run (none currently exist, but that's the convention for anything that hits live network endpoints instead of pure logic).
 
+## Deployment
+
+A hosted instance runs on Railway (`https://us-gov-open-data-mcp-production.up.railway.app`), built from `main` via the `Dockerfile` and served over `httpStream`. Constraints that aren't visible from the code:
+
+- **Railway never reads `.env`.** It's gitignored and excluded by `.dockerignore`, so the container has no secrets unless they're entered in Railway's own Variables UI. Every API key you want working in production must be copied there by hand — a key present locally will silently be absent in the deployment.
+- **Keep it at one replica.** OAuth login state (`transactions`, `clientCodes`) lives in-process with no sticky sessions, so a second replica breaks logins mid-flow with "Invalid or expired state". The disk cache is also per-replica and per-deploy.
+- **The disk cache is ephemeral here.** `~/.cache/us-gov-open-data-mcp/cache.json` sits on the container's writable layer and is wiped on every deploy, so it never warms across releases. To keep it: mount a Railway volume and set `XDG_CACHE_HOME` to the mount path — `getCacheDir()` in `src/shared/client.ts` already honors it, so this needs no code change. Safe to persist only because the cache key no longer embeds API keys (see `buildCacheKeyUrl`); it was not safe before that change.
+- **OAuth sessions don't survive a restart**, so each deploy signs every OAuth user out. A volume does *not* fix this on its own — unlike the response cache, OAuth state is in RAM, not on disk. Only `tokenStorage` is pluggable (`get`/`save`/`delete`/`cleanup`); `transactions`, `clientCodes` and `registeredClients` are hardcoded in-process `Map`s, which is also why no storage backend can enable multiple replicas. If you do implement a persistent `tokenStorage`, you **must** also set `MCP_OAUTH_ENCRYPTION_KEY` and `MCP_OAUTH_JWT_SIGNING_KEY`: fastmcp wraps storage in `EncryptedTokenStorage` with a per-process key when none is supplied, so otherwise the persisted data is unreadable after restart and you get persistence that silently does nothing.
+- **Unauthenticated endpoints on the public URL**: `/health`, plus `/ping` and `/ready` (the latter reports live session counts). fastmcp provides no way to disable those two; treat it as accepted minor info disclosure rather than a bug to rediscover.
+
+Verifying a deploy is manual — CI does not exercise the HTTP path at all. `curl /health` should return `ok`, and `/mcp` should return 401 without a credential and 200 with one.
+
 ## Architecture
 
 ### stdio vs. httpStream have different trust models
 
-stdio (the default — Claude Desktop/VS Code/Cursor) is a local pipe to one trusted client; no auth needed. httpStream is a network listener, and this server holds live API keys for ~40 upstream services, so `server.ts` **refuses to start** with `--transport httpStream` unless `MCP_AUTH_TOKEN` is set — a missing token fails closed (`process.exit(1)`), it does not fall back to unauthenticated. Requests must present it as `Authorization: Bearer <token>` or `?token=` (constant-time compared). `/health` is intentionally exempt (for platform health checks) and needs no token. The Dockerfile sets `MCP_TRANSPORT=httpStream` + `MCP_HOST=0.0.0.0` for container deployment (e.g. Railway) — `PORT`/`MCP_PORT`/`--port` are all honored, in that precedence order, and `SIGTERM`/`SIGINT` trigger a clean `server.stop()` instead of waiting to be killed.
+stdio (the default — Claude Desktop/VS Code/Cursor) is a local pipe to one trusted client; no auth needed. httpStream is a network listener, and this server holds live API keys for ~40 upstream services, so it **fails closed**: `resolveAuthConfig` (`src/server/auth.ts`) validates every auth env var at startup and `server.ts` `process.exit(1)`s if no usable credential is configured. It never falls back to unauthenticated. All problems are printed at once rather than one per boot, because each redeploy cycle costs minutes.
+
+Two credential types, and both can be active simultaneously (`MCP_AUTH_MODE` = `static` | `oauth` | `both`):
+
+- **Static shared token** (`MCP_AUTH_TOKEN`) — `Authorization: Bearer <token>`, compared via SHA-256 + `timingSafeEqual` (hashing first keeps the compared buffers a fixed 32 bytes, so no length is leaked and `timingSafeEqual` can't throw). Minimum 32 chars; blank/short/placeholder values are fatal, not warnings. `?token=` is only read when `MCP_ALLOW_QUERY_TOKEN` is set, since query strings leak into access logs.
+- **Microsoft Entra ID OAuth** (`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID` + `MCP_PUBLIC_URL`) — see `docs/guide/oauth-azure.md`.
+
+`/health` is intentionally exempt (for platform health checks). The Dockerfile sets `MCP_TRANSPORT=httpStream` + `MCP_HOST=0.0.0.0` for container deployment (e.g. Railway) — `PORT`/`MCP_PORT`/`--port` are all honored, in that precedence order, and `SIGTERM`/`SIGINT` trigger a clean `server.stop()`.
+
+**The authenticator must throw, never return `undefined`.** fastmcp's stateful `createServer` path does not null-check the auth result before creating a session, so returning `undefined` (which `AuthProvider.authenticate` does on every failure) would leave `GET /sse` — and the `POST /messages?sessionId=` that follows — reachable with no credential at all. `createAuthenticator` throws a `Response`; `tests/auth.test.ts` pins this explicitly.
+
+### fastmcp's OAuth routes are unsafe as shipped — we shadow two of them
+
+Passing `auth: <provider>` makes fastmcp register `/oauth/*` and `/.well-known/*` outside the authenticate gate. Two of those routes are exploitable in 3.35.0, so `src/server/oauth-routes.ts` replaces them via `server.getApp()` (fastmcp calls `honoApp.fetch()` first and returns on any non-404, so Hono routes win):
+
+- `POST /oauth/register` returns the **upstream** app's `client_secret` — i.e. one anonymous curl retrieves your Entra client ID and secret. Our handler strips it and advertises `token_endpoint_auth_method: "none"`, which is safe because the proxy's `exchangeAuthorizationCode` never checks the secret (only `client_id` + PKCE).
+- `GET /oauth/authorize` never validates `redirect_uri` against anything and treats PKCE as optional, so a crafted link can deliver a live authorization code to an attacker's host. Our handler enforces an exact allowlist and requires `S256` PKCE.
+
+Do **not** try to fix these by configuring `allowedRedirectUriPatterns`: that check falls open (returns true for any `https:` URI when no pattern matches), and its matcher builds a RegExp without escaping, so `.` acts as a wildcard. Redirect restriction has to live in our handlers. `tests/oauth-guards.test.ts` covers both, using a stub proxy that deliberately mimics the unsafe behavior so the tests prove *our* guard blocks it.
 
 ### Module = folder, auto-discovered by the server
 
@@ -86,4 +116,33 @@ The sandbox's `setMemoryLimit(64MB)` only bounds QuickJS's own WASM heap — the
 
 `tests/helpers.ts` uses Vite's `import.meta.glob` to eagerly import every `src/apis/*/index.ts` and drives all the generic per-module checks in `tests/module-structure.test.ts` (required fields, snake_case tool names, valid `domains`/`crossRef` question types, annotation shape, no duplicate tool names within or across modules). Adding a module means these tests exercise it automatically — no per-module test file needed unless the module has bespoke logic worth unit-testing directly (e.g. `tests/socrata-portal-validation.test.ts` tests `assertPortal`'s SSRF guard — including regression cases for previously-confirmed bypasses like `172.16.0.0/12` and octal/hex-encoded IP literals — since that's logic no generic structural test could catch; `tests/sandbox-security.test.ts` similarly covers `code_mode`'s host-side stdout cap and concurrency limit, not just the sandbox's own WASM memory/timeout limits).
 
-`server.ts` itself has no unit tests — it's a top-level script with side effects (module discovery via `readdirSync`/dynamic `import()`, `process.argv` parsing, `server.start()`, `process.exit`), not a set of pure functions. Auth/transport behavior (`MCP_AUTH_TOKEN` enforcement, `/health`, `PORT`, `SIGTERM`) is verified by manually running `dist/server.js` and hitting it with `curl`, not by an automated test — keep that in mind before assuming CI covers the httpStream path.
+`server.ts` itself still has no unit tests — it's a top-level script with side effects (module discovery via `readdirSync`/dynamic `import()`, `process.argv` parsing, `server.start()`, `process.exit`), not a set of pure functions. That's why the auth *decisions* were extracted into `src/server/auth.ts` and `src/server/oauth-routes.ts`, which are covered by `tests/auth.test.ts` and `tests/oauth-guards.test.ts`: `resolveAuthConfig` takes `env` as a plain object rather than reading `process.env`, and the guards are exercised against a real Hono app with a stub proxy. Neither uses `vi.mock` — the OAuth delegate and proxy are hand-written objects satisfying an interface, consistent with the repo's no-mocking convention.
+
+What those tests do **not** cover, and which still needs `curl` against a running `dist/server.js`: that the Hono guard routes actually shadow fastmcp's built-in ones (route precedence is a runtime property of fastmcp's request handler), `/health`, `PORT`, `SIGTERM`, and the real Microsoft handshake (which needs a live tenant). Don't assume CI proves the httpStream path end-to-end.
+
+## Project history
+
+### This is a fork, and upstream is still alive
+
+Origin is `mjacoub-imb/us-gov-open-data-mcp`, forked from `lzinga/us-gov-open-data-mcp` (upstream started 2026-02, bulk of the ~80 commits landed 2026-03, tapering since). `main` still contains merge commits from upstream, so upstream merges are an expected event, not a one-off.
+
+**Everything under "Security posture" below exists only in this fork.** None of it has been contributed upstream, so a careless `git merge upstream/main` can silently revert it — the auth block in `server.ts` and `assertPortal` in the socrata SDK are the likeliest conflict sites. After any upstream merge, re-run `npx vitest run` and confirm `tests/auth.test.ts`, `tests/oauth-guards.test.ts`, `tests/socrata-portal-validation.test.ts` and `tests/sandbox-security.test.ts` still pass before pushing.
+
+### Security posture (2026-08)
+
+A deliberate security review ahead of the Railway deployment found that the code was written for a trusted single-user **stdio** deployment while the `Dockerfile` silently reconfigures it as an untrusted multi-user **HTTP** one. Nearly every finding traced to that single mismatch. Two rounds of hardening followed; the *what* is documented in the architecture sections above, this records the *why* so it doesn't get undone:
+
+**PR #1 (merged 2026-08-07)** — four criticals, all confirmed by running code rather than inspection:
+- httpStream had no authentication at all, so deploying would have published ~40 upstream API keys as an open proxy.
+- `code_mode` could grow the Node heap ~519MB in ~1.1s and OOM-kill the process — measured, not theoretical. The sandbox's own 64MB limit doesn't apply because the output string lives on the host heap.
+- `code_mode` bypassed every tool's Zod validation by calling `execute()` directly.
+- Socrata's SSRF denylist admitted `172.16.0.0/12`, `*.railway.internal`, `metadata.google.internal` and octal-encoded loopback, *and* attached `SOCRATA_APP_TOKEN` to whatever host the caller named. Replaced with an allowlist.
+Also: request timeout extended to cover body reads, `Retry-After` capped, API keys removed from the disk cache key, rate-limiter queue bounded, path segments encoded, 9 dependency advisories cleared, container de-rooted.
+
+**PR #2 (open as of 2026-08-08)** — Microsoft Entra ID sign-in, so a team can use per-person identity instead of one shared token. Most of that PR is *not* the OAuth wiring: verification found fastmcp's own OAuth proxy returns the upstream Azure `client_secret` to anonymous callers and never validates `redirect_uri`, so the bulk is the guard routes described above. Worth reporting upstream to fastmcp — those flaws affect every provider it ships, not just Azure.
+
+### Standing constraints
+
+- The static token and Microsoft OAuth are intentionally *both* supported. Don't "simplify" by deleting the static path — it's what Claude Code CLI, scripts and CI use, and it's the fallback if Azure config breaks.
+- Fail-closed on httpStream is deliberate. If a change makes the server start without a credential, that's a regression regardless of what else it fixes.
+- Prefer fixing a class of bug over an instance: the reviews above repeatedly found the same shape (a denylist that fails open, a limit that doesn't bound the thing it appears to). Both `docs/guide/oauth-azure.md` and the architecture notes call out where *not* to trust a library default.
