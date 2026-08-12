@@ -32,8 +32,14 @@ export default {
     "usaspending/treasury cannot answer a state agency budget question.",
   domains: ["economy", "health", "housing", "safety", "transportation", "spending"],
   crossRef: [
-    { question: "state-level", route: "socrata_search_datasets (find state agency datasets) → socrata_query (pull rows) — for data federal APIs don't carry" },
-    { question: "spending/budget", route: "socrata_search_datasets scoped to that state's portal (e.g. domains:['data.ny.gov'], query:'budget appropriations') → socrata_query — the ONLY source here for STATE agency budgets/appropriations/expenditures. Coverage varies by state; verify before answering" },
+    // Both hints are `primary`: this is the only module here that reaches
+    // arbitrary state/local government datasets and STATE agency budgets —
+    // every other contributor to these two question types answers a
+    // federal-level or federally-disaggregated version of the question.
+    // Without `primary`, this hint sits wherever module-iteration order
+    // puts it in a 20+-module "+"-joined line and gets missed in practice.
+    { question: "state-level", route: "socrata_search_datasets (find state agency datasets) → socrata_query (pull rows) — for data federal APIs don't carry", primary: true },
+    { question: "spending/budget", route: "socrata_search_datasets scoped to that state's portal (e.g. domains:['data.ny.gov'], query:'budget appropriations') → socrata_query — the ONLY source here for STATE agency budgets/appropriations/expenditures. Coverage varies by state; verify before answering", primary: true },
   ],
   reference: {
     statePortals: STATE_PORTALS,

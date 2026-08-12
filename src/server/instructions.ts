@@ -148,7 +148,7 @@ const GROUPED_CALLING_CONVENTION = [
  */
 function buildRoutingTable(modules: ApiModule[]): string {
   // Collect all hints grouped by question type
-  const questionMap = new Map<string, { displayName: string; route: string }[]>();
+  const questionMap = new Map<string, { displayName: string; route: string; primary?: boolean }[]>();
 
   for (const mod of modules) {
     if (!mod.crossRef) continue;
@@ -158,6 +158,7 @@ function buildRoutingTable(modules: ApiModule[]): string {
       questionMap.get(key)!.push({
         displayName: mod.displayName,
         route: hint.route,
+        primary: hint.primary,
       });
     }
   }
@@ -171,15 +172,26 @@ function buildRoutingTable(modules: ApiModule[]): string {
     "",
   ];
 
+  const fmt = (e: { displayName: string; route: string }) => `${e.displayName}(${e.route})`;
+
   // Output in QUESTION_TYPES order (topic-clustered, not alphabetical)
   for (const question of QUESTION_TYPES) {
     const entries = questionMap.get(question);
     if (!entries?.length) continue;
 
-    const routeStr = entries
-      .map((e) => `${e.displayName}(${e.route})`)
-      .join(" + ");
-    lines.push(`${question.toUpperCase()} \u2192 ${routeStr}`);
+    const primary = entries.filter((e) => e.primary);
+    if (primary.length === 0) {
+      lines.push(`${question.toUpperCase()} \u2192 ${entries.map(fmt).join(" + ")}`);
+      continue;
+    }
+
+    // A question type this crowded can bury a hint that's genuinely the
+    // only correct answer for its sub-case \u2014 pull primary hints out front
+    // instead of leaving them at whatever position iteration order put them.
+    const rest = entries.filter((e) => !e.primary);
+    const primaryStr = `START HERE: ${primary.map(fmt).join(" + ")}`;
+    const restStr = rest.length ? ` | Also: ${rest.map(fmt).join(" + ")}` : "";
+    lines.push(`${question.toUpperCase()} \u2192 ${primaryStr}${restStr}`);
   }
 
   return lines.join("\n");

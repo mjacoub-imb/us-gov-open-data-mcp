@@ -97,6 +97,53 @@ describe("buildInstructions", () => {
     expect(econIdx).toBeLessThan(housingIdx);
   });
 
+  // A question type like "state-level" or "spending/budget" can accumulate
+  // 20+ contributing modules, concatenated into one long "+"-joined line.
+  // A module whose route is the ONLY correct answer for a meaningfully
+  // different sub-case (e.g. socrata is the only source for STATE agency
+  // budgets, as opposed to the dozen federal-spending modules also in that
+  // bucket) needs to stand out from that wall of text rather than being
+  // buried at whatever position module-iteration order happens to put it.
+  it("highlights a primary crossRef hint ahead of non-primary hints in the same question type", () => {
+    const socrataLike = mockModule({
+      name: "socrata",
+      displayName: "Socrata",
+      crossRef: [{ question: "spending/budget", route: "socrata_query — the ONLY source for STATE budgets", primary: true }],
+    });
+    const treasury = mockModule({
+      name: "treasury",
+      displayName: "Treasury",
+      crossRef: [{ question: "spending/budget", route: "query_fiscal_data" }],
+    });
+    const fred = mockModule({
+      name: "fred",
+      displayName: "FRED",
+      crossRef: [{ question: "spending/budget", route: "FYFSGDA188S" }],
+    });
+    const result = buildInstructions([treasury, fred, socrataLike]);
+
+    expect(result).toContain(
+      "SPENDING/BUDGET → START HERE: Socrata(socrata_query — the ONLY source for STATE budgets) | Also: Treasury(query_fiscal_data) + FRED(FYFSGDA188S)",
+    );
+  });
+
+  it("uses the plain '+'-joined format when no hint in a question type is primary", () => {
+    const fred = mockModule({
+      name: "fred",
+      displayName: "FRED",
+      crossRef: [{ question: "spending/budget", route: "FYFSGDA188S" }],
+    });
+    const treasury = mockModule({
+      name: "treasury",
+      displayName: "Treasury",
+      crossRef: [{ question: "spending/budget", route: "query_fiscal_data" }],
+    });
+    const result = buildInstructions([fred, treasury]);
+
+    expect(result).toContain("SPENDING/BUDGET → FRED(FYFSGDA188S) + Treasury(query_fiscal_data)");
+    expect(result).not.toContain("START HERE");
+  });
+
   it("skips empty question types", () => {
     const mod = mockModule({ crossRef: [{ question: "economy", route: "GDP" }] });
     const result = buildInstructions([mod]);
@@ -266,6 +313,23 @@ describe("Routing table coverage", () => {
 
     const uncovered = QUESTION_TYPES.filter(q => !coveredQuestions.has(q));
     expect(uncovered, `Uncovered question types: ${uncovered.join(", ")}`).toHaveLength(0);
+  });
+
+  // Regression guard: socrata is the only module reaching arbitrary
+  // state/local government datasets and STATE agency budgets, but
+  // "state-level" and "spending/budget" each have 10-20+ other contributing
+  // modules (mostly federal or federally-disaggregated data). Without
+  // `primary`, socrata's hint gets buried in that "+"-joined line and the
+  // model reliably misses it for questions only socrata can answer.
+  it("socrata's state-level and spending/budget hints stay marked primary", () => {
+    const socrata = allModules.find(m => m.name === "socrata");
+    expect(socrata, "socrata module not found").toBeDefined();
+
+    for (const question of ["state-level", "spending/budget"]) {
+      const hint = socrata!.crossRef?.find(h => h.question === question);
+      expect(hint, `socrata: no crossRef hint for "${question}"`).toBeDefined();
+      expect(hint!.primary, `socrata: "${question}" hint should be primary`).toBe(true);
+    }
   });
 });
 

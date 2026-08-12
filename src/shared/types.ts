@@ -108,6 +108,21 @@ export interface RouteHint {
   question: QuestionType;
   /** Specific tools, series IDs, or parameters to use for this question type. */
   route: string;
+  /**
+   * Mark this hint as the answer for a meaningfully different sub-case of
+   * the question type that no other contributing module covers — not just
+   * "this module is also relevant." A question type like "state-level" or
+   * "spending/budget" can accumulate 20+ contributing modules concatenated
+   * into one "+"-joined routing-table line; an entry that's genuinely the
+   * only correct source for its sub-case (e.g. socrata is the only source
+   * here for STATE agency budgets, as opposed to the dozen federal-spending
+   * modules also in that bucket) needs to stand out from that line rather
+   * than being buried at whatever position module-iteration order puts it.
+   * Primary hints render first, prefixed "START HERE:", ahead of the rest
+   * under "Also:". Overusing this defeats its purpose — reserve it for
+   * hints that are truly exclusive for their sub-case.
+   */
+  primary?: boolean;
 }
 
 /** Metadata for an API module — identity, auth, and reference data. */
