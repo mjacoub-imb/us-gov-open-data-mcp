@@ -9,7 +9,7 @@
  * Docs: https://data.cms.gov/provider-data/
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 // ─── Client ──────────────────────────────────────────────────────────
 
@@ -202,7 +202,7 @@ export async function searchDatasets(keyword: string): Promise<CmsDatasetSummary
  */
 export async function getDatasetDetails(datasetId: string): Promise<CmsDatasetDetail | null> {
   try {
-    const res = (await api.get(`/metastore/schemas/dataset/items/${encodeURIComponent(datasetId)}`, {
+    const res = (await api.get(path`/metastore/schemas/dataset/items/${datasetId}`, {
       "show-reference-ids": "",
     })) as Record<string, unknown>;
     if (!res || !res.identifier) return null;

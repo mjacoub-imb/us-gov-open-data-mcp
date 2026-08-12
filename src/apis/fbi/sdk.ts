@@ -10,7 +10,7 @@
  * Docs: https://cde.ucr.cjis.gov/LATEST/webapp/#/pages/docApi
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 // ─── Client ──────────────────────────────────────────────────────────
 
@@ -204,7 +204,7 @@ function mmYYYY(year: number, month = 1): string {
 
 /** Get all law enforcement agencies in a state, grouped by county. */
 export async function getAgenciesByState(state: string): Promise<unknown> {
-  return api.get(`/agency/byStateAbbr/${encodeURIComponent(state.toUpperCase())}`);
+  return api.get(path`/agency/byStateAbbr/${state.toUpperCase()}`);
 }
 
 // ── 2. Summarized Crime (UCR) ────────────────────────────────────────
@@ -411,7 +411,7 @@ export async function getUseOfForceState(opts: {
   year: number;
   quarter?: number;
 }): Promise<unknown> {
-  return api.get(`/participation/state/${encodeURIComponent(opts.state.toUpperCase())}/uof/states`, {
+  return api.get(path`/participation/state/${opts.state.toUpperCase()}/uof/states`, {
     year: String(opts.year), quarter: String(opts.quarter ?? 4),
   });
 }
@@ -423,7 +423,7 @@ export async function getUseOfForceReports(opts: {
   year: number;
   quarter?: number;
 }): Promise<unknown> {
-  return api.get(`/uof/reports/${encodeURIComponent(opts.grp)}/${encodeURIComponent(opts.spec)}`, {
+  return api.get(path`/uof/reports/${opts.grp}/${opts.spec}`, {
     year: String(opts.year), quarter: String(opts.quarter ?? 4),
   });
 }

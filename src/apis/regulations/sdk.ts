@@ -15,7 +15,7 @@
  * Docs: https://open.gsa.gov/api/regulationsgov/
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 // ─── Client ──────────────────────────────────────────────────────────
 
@@ -151,7 +151,7 @@ export async function searchDocuments(opts: {
  * Get detailed information for a single document by its document ID.
  */
 export async function getDocument(documentId: string): Promise<RegulationsDetailResponse<RegulationsDocument>> {
-  return api.get<RegulationsDetailResponse<RegulationsDocument>>(`/documents/${encodeURIComponent(documentId)}`);
+  return api.get<RegulationsDetailResponse<RegulationsDocument>>(path`/documents/${documentId}`);
 }
 
 /**
@@ -187,7 +187,7 @@ export async function searchComments(opts: {
  * Get detailed information for a single comment.
  */
 export async function getComment(commentId: string): Promise<RegulationsDetailResponse<RegulationsComment>> {
-  return api.get<RegulationsDetailResponse<RegulationsComment>>(`/comments/${encodeURIComponent(commentId)}`);
+  return api.get<RegulationsDetailResponse<RegulationsComment>>(path`/comments/${commentId}`);
 }
 
 /**
@@ -215,7 +215,7 @@ export async function searchDockets(opts: {
  * Get detailed information for a single docket.
  */
 export async function getDocket(docketId: string): Promise<RegulationsDetailResponse<RegulationsDocket>> {
-  return api.get<RegulationsDetailResponse<RegulationsDocket>>(`/dockets/${encodeURIComponent(docketId)}`);
+  return api.get<RegulationsDetailResponse<RegulationsDocket>>(path`/dockets/${docketId}`);
 }
 
 /** Clear cached responses. */

@@ -6,8 +6,15 @@
  * between executions. Also validates resource limits (timeout, memory, data size).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { executeInSandbox } from "../src/shared/sandbox.js";
+import {
+  __resetSandboxConcurrencyForTests,
+  acquireSlot,
+  MAX_CONCURRENT,
+  MAX_SANDBOX_QUEUE_LENGTH,
+  sandboxQueueLength,
+} from "../src/shared/sandbox.js";
 
 const SAMPLE_DATA = JSON.stringify({ value: 42 });
 
@@ -164,6 +171,31 @@ describe("Resource limits", () => {
     // least 3 sequential batches (~900ms+); fully parallel would finish in ~300ms.
     expect(elapsed).toBeGreaterThan(600);
   }, 20_000);
+});
+
+// ─── Concurrency wait-queue bound ────────────────────────────────────
+//
+// The concurrency limiter's `_queue` is structurally the same "push a
+// resolver, shift it on release" pattern as TokenBucket's rate-limiter queue
+// in src/shared/client.ts — which is bounded (MAX_QUEUE_LENGTH) precisely so
+// a burst far exceeding capacity fails fast instead of piling up unbounded
+// pending promises. This sandbox queue had no analogous bound.
+describe("Sandbox concurrency wait-queue is bounded", () => {
+  afterEach(() => {
+    __resetSandboxConcurrencyForTests();
+  });
+
+  it("fails fast once the wait queue is at capacity, instead of growing unbounded", async () => {
+    // Fill every active slot, then fill the wait queue to capacity. None of
+    // these are awaited to completion — acquireSlot() synchronously pushes
+    // onto the queue before its first `await`, so this is instant and never
+    // touches the real QuickJS runtime.
+    for (let i = 0; i < MAX_CONCURRENT; i++) void acquireSlot();
+    for (let i = 0; i < MAX_SANDBOX_QUEUE_LENGTH; i++) void acquireSlot().catch(() => {});
+
+    expect(sandboxQueueLength()).toBe(MAX_SANDBOX_QUEUE_LENGTH);
+    await expect(acquireSlot()).rejects.toThrow(/queue is full/i);
+  });
 });
 
 // ─── Prototype pollution ────────────────────────────────────────────

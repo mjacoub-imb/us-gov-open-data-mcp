@@ -65,15 +65,26 @@ const MAX_STDOUT_BYTES = 256 * 1024;
 /** Max concurrent sandbox executions. Each one reserves up to 64MB of WASM
  *  memory plus up to 10MB of DATA; unbounded concurrency on a shared process
  *  (e.g. behind the HTTP transport) can exhaust host memory well before any
- *  single execution's own limits kick in. */
-const MAX_CONCURRENT = 3;
+ *  single execution's own limits kick in. Exported for tests/sandbox-security.test.ts. */
+export const MAX_CONCURRENT = 3;
+
+/** Max callers allowed to wait for a slot at once — same rationale as
+ *  TokenBucket.MAX_QUEUE_LENGTH in src/shared/client.ts: without this, a
+ *  burst of concurrent code_mode calls far exceeding MAX_CONCURRENT
+ *  accumulates unbounded pending promises instead of failing fast. */
+export const MAX_SANDBOX_QUEUE_LENGTH = 500;
+
 let _active = 0;
 const _queue: Array<() => void> = [];
 
-async function acquireSlot(): Promise<void> {
+/** Exported for tests/sandbox-security.test.ts. */
+export async function acquireSlot(): Promise<void> {
   if (_active < MAX_CONCURRENT) {
     _active++;
     return;
+  }
+  if (_queue.length >= MAX_SANDBOX_QUEUE_LENGTH) {
+    throw new Error("Sandbox execution queue is full — too many concurrent code_mode calls. Try again shortly.");
   }
   await new Promise<void>(resolve => _queue.push(resolve));
   _active++;
@@ -83,6 +94,17 @@ function releaseSlot(): void {
   _active--;
   const next = _queue.shift();
   if (next) next();
+}
+
+/** Number of callers currently waiting for a slot. Exported for tests/sandbox-security.test.ts. */
+export function sandboxQueueLength(): number {
+  return _queue.length;
+}
+
+/** Test-only: reset concurrency-limiter state between tests. Exported for tests/sandbox-security.test.ts. */
+export function __resetSandboxConcurrencyForTests(): void {
+  _active = 0;
+  _queue.length = 0;
 }
 
 // ─── Executor ────────────────────────────────────────────────────────

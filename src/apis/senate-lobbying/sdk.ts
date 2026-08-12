@@ -9,7 +9,7 @@
  *   const filings = await searchFilings({ registrant_name: "Pfizer", filing_year: 2025 });
  */
 
-import { createClient, qp } from "../../shared/client.js";
+import { createClient, path, qp } from "../../shared/client.js";
 
 const api = createClient({
   baseUrl: "https://lda.gov/api/v1",
@@ -171,7 +171,7 @@ export async function searchFilings(opts: {
 
 /** Get a specific filing by UUID — includes full lobbying activity detail. */
 export async function getFilingDetail(uuid: string): Promise<LdaFiling> {
-  return api.get<LdaFiling>(`/filings/${encodeURIComponent(uuid)}/`);
+  return api.get<LdaFiling>(path`/filings/${uuid}/`);
 }
 
 /** Search lobbying contributions (campaign donations by lobbyists). */

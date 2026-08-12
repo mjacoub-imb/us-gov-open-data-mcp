@@ -17,7 +17,7 @@
  *   ECHO: https://echo.epa.gov/tools/web-services
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path as encodedPath } from "../../shared/client.js";
 
 // ─── Clients ─────────────────────────────────────────────────────────
 
@@ -366,7 +366,7 @@ export async function getUVIndex(opts: {
 }): Promise<UVForecast[]> {
   if (opts.city && opts.state) {
     return envirofacts.get<UVForecast[]>(
-      `/getEnvirofactsUVDAILY/CITY/${encodeURIComponent(opts.city)}/STATE/${opts.state.toUpperCase()}/JSON`,
+      encodedPath`/getEnvirofactsUVDAILY/CITY/${opts.city}/STATE/${opts.state.toUpperCase()}/JSON`,
     );
   }
   const zip = opts.zip ?? "20001";
@@ -389,12 +389,12 @@ export async function getToxicReleases(opts: {
   rows?: number;
 }): Promise<TRIFacility[]> {
   const limit = opts.rows ?? 100;
-  let path = `/tri.tri_facility/state_abbr/equals/${opts.state.toUpperCase()}`;
+  let p = `/tri.tri_facility/state_abbr/equals/${opts.state.toUpperCase()}`;
   if (opts.county) {
-    path += `/county_name/equals/${encodeURIComponent(opts.county.toUpperCase())}`;
+    p += encodedPath`/county_name/equals/${opts.county.toUpperCase()}`;
   }
-  path += `/1:${limit}/JSON`;
-  return envirofacts.get<TRIFacility[]>(path);
+  p += `/1:${limit}/JSON`;
+  return envirofacts.get<TRIFacility[]>(p);
 }
 
 /**

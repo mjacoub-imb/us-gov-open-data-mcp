@@ -10,7 +10,7 @@
  * Docs: https://www.nhtsa.gov/nhtsa-datasets-and-apis
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path as encodedPath } from "../../shared/client.js";
 
 // ─── Clients ─────────────────────────────────────────────────────────
 
@@ -246,7 +246,7 @@ export async function getProductModels(opts: {
  *   await decodeVin("1HGCM82633A123456");
  */
 export async function decodeVin(vin: string): Promise<VinResult> {
-  const res = await vpicApi.get<{ Results?: VinResult[] }>(`/vehicles/DecodeVinValues/${encodeURIComponent(vin)}`, { format: "json" });
+  const res = await vpicApi.get<{ Results?: VinResult[] }>(encodedPath`/vehicles/DecodeVinValues/${vin}`, { format: "json" });
   return res?.Results?.[0] ?? {};
 }
 
@@ -265,10 +265,10 @@ export async function getModelsForMake(opts: {
   make: string;
   modelYear?: number;
 }): Promise<Array<{ Make_ID: number; Make_Name: string; Model_ID: number; Model_Name: string }>> {
-  const path = opts.modelYear
-    ? `/vehicles/GetModelsForMakeYear/make/${encodeURIComponent(opts.make)}/modelyear/${opts.modelYear}`
-    : `/vehicles/GetModelsForMake/${encodeURIComponent(opts.make)}`;
-  const res = await vpicApi.get<{ Results?: Array<{ Make_ID: number; Make_Name: string; Model_ID: number; Model_Name: string }> }>(path, { format: "json" });
+  const modelsPath = opts.modelYear
+    ? encodedPath`/vehicles/GetModelsForMakeYear/make/${opts.make}/modelyear/${opts.modelYear}`
+    : encodedPath`/vehicles/GetModelsForMake/${opts.make}`;
+  const res = await vpicApi.get<{ Results?: Array<{ Make_ID: number; Make_Name: string; Model_ID: number; Model_Name: string }> }>(modelsPath, { format: "json" });
   return res?.Results ?? [];
 }
 
@@ -289,7 +289,7 @@ export async function getSafetyRatingVehicles(opts: {
   modelYear: number;
 }): Promise<SafetyRatingVehicle[]> {
   const res = await api.get<NhtsaResponse<SafetyRatingVehicle>>(
-    `/SafetyRatings/modelyear/${opts.modelYear}/make/${encodeURIComponent(opts.make)}/model/${encodeURIComponent(opts.model)}`,
+    encodedPath`/SafetyRatings/modelyear/${opts.modelYear}/make/${opts.make}/model/${opts.model}`,
   );
   return extractResults(res);
 }
