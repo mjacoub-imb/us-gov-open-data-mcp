@@ -93,6 +93,23 @@ describe("socrata: assertPortal bypass regressions (SOCRATA_ALLOW_ANY_PORTAL=tru
     expect(() => assertPortal(input)).toThrow();
   });
 
+  // getaddrinfo()-based resolvers (and Node's fetch) accept shorthand dotted
+  // IPv4 forms with fewer than 4 labels — the trailing label absorbs the
+  // remaining octets (inet_aton semantics) — so "127.1" resolves to
+  // 127.0.0.1 and "172.16.1" resolves to 172.16.0.1, same as their 4-label
+  // form. parseIPv4Literal previously required exactly 4 labels, so these
+  // slipped past isPrivateOrReservedHost entirely.
+  it.each([
+    "127.1", // == 127.0.0.1
+    "10.1", // == 10.0.0.1
+    "172.16.1", // == 172.16.0.1
+    "192.168.1", // == 192.168.0.1
+    "0177.1", // octal 127 . 0.0.1
+  ])("still rejects shorthand IPv4 literal %s even when opted in", (input) => {
+    process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
+    expect(() => assertPortal(input)).toThrow();
+  });
+
   it("allows a well-formed public hostname outside the curated list when opted in", () => {
     process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
     expect(assertPortal("data.arizona.gov")).toBe("data.arizona.gov");

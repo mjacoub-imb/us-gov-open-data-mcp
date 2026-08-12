@@ -1568,14 +1568,22 @@ const xmlParser = new XMLParser({
     name === "recorded-vote" || name === "totals-by-party",
   // Parse numeric-looking values as numbers
   parseTagValue: true,
-  // Don't expand custom/DTD entities from the response body — this XML comes
-  // from clerk.house.gov / senate.gov, but there's no reason to leave entity
-  // expansion on for externally-sourced XML.
-  processEntities: false,
+  // Leave predefined-entity decoding (&amp; &lt; &gt; &quot; &apos;) ON — vote
+  // titles/questions routinely contain "&amp;" and need it decoded — while
+  // relying on fast-xml-parser v5's structural DTD defenses rather than a
+  // blanket processEntities:false (which disabled ALL entity decoding, not
+  // just custom/DTD ones, and silently corrupted vote text). External
+  // (SYSTEM) and parameter (%) entities are hard-rejected at parse time
+  // regardless of this option (DocTypeReader.readEntityExp), and an internal
+  // entity whose value itself contains "&" is never registered — closing off
+  // both XXE and recursive entity-bomb expansion independent of this flag.
+  // maxEntityCount/maxEntitySize below are defense-in-depth against a large
+  // number/size of internal entities in a single response.
+  processEntities: { maxEntityCount: 100, maxEntitySize: 2000 },
 });
 
-/** Parse XML string into a JS object using fast-xml-parser. */
-function parseXml<T = Record<string, unknown>>(xml: string): T {
+/** Parse XML string into a JS object using fast-xml-parser. Exported for tests/congress-vote-xml.test.ts. */
+export function parseXml<T = Record<string, unknown>>(xml: string): T {
   return xmlParser.parse(xml) as T;
 }
 

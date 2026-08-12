@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -425,10 +426,19 @@ async function fetchTimeout(url: string, init: RequestInit | undefined, timeoutM
  *  slow/malicious upstream streaming an unbounded body into process memory. */
 const MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
 
-/** Read a response body as text, aborting once it exceeds `maxBytes`. */
-async function readBodyCapped(res: Response, maxBytes: number): Promise<string> {
+/** Read a response body as text, aborting once it exceeds `maxBytes`. Exported for tests/client-security.test.ts. */
+export async function readBodyCapped(res: Response, maxBytes: number): Promise<string> {
   const reader = res.body?.getReader();
-  if (!reader) return res.text();
+  if (!reader) {
+    // No readable stream to cap incrementally (e.g. a body-less Response) —
+    // fall back to buffering it whole, but still enforce the cap on the
+    // result rather than trusting it unconditionally.
+    const text = await res.text();
+    if (text.length > maxBytes) {
+      throw new Error(`Response body exceeded ${(maxBytes / 1024 / 1024).toFixed(0)}MB limit`);
+    }
+    return text;
+  }
 
   const decoder = new TextDecoder();
   let text = "";
@@ -518,6 +528,26 @@ async function fetchRetry(
   throw lastErr ?? new Error("Request failed");
 }
 
+/**
+ * One-way fingerprint of a resolved auth-params record, for folding into a
+ * disk cache key WITHOUT ever writing the raw credential to disk.
+ *
+ * `buildCacheKeyUrl` deliberately omits auth params from the cache key so
+ * `cache.json` never carries a plaintext API key — but that means the key
+ * doesn't change when an operator rotates a credential (or swaps env vars),
+ * so a request made under the new credential can be served a response that
+ * was actually fetched under the old one. Hashing the resolved value keeps
+ * the "no secrets on disk" property (SHA-256 isn't meaningfully reversible
+ * for this purpose) while still invalidating the cache on rotation.
+ *
+ * Exported for tests/client-security.test.ts.
+ */
+export function authCacheFingerprint(resolved: Record<string, string>): string {
+  const keys = Object.keys(resolved);
+  if (keys.length === 0) return "";
+  return createHash("sha256").update(JSON.stringify(resolved)).digest("hex").slice(0, 12);
+}
+
 /** Truncate body text to a manageable size for inclusion in error messages. */
 function truncateBody(body: string, max = 300): string {
   if (body.length <= max) return body;
@@ -546,9 +576,30 @@ function serializeParams(params?: Params): string[] {
 }
 
 /** Join a base URL, path, and pre-built query fragments into a full URL. */
-function joinUrl(baseUrl: string, path: string, parts: string[]): string {
-  const p = path.startsWith("/") ? path : `/${path}`;
+function joinUrl(baseUrl: string, urlPath: string, parts: string[]): string {
+  const p = urlPath.startsWith("/") ? urlPath : `/${urlPath}`;
   return parts.length ? `${baseUrl}${p}?${parts.join("&")}` : `${baseUrl}${p}`;
+}
+
+/**
+ * Tagged template for building a request path with every interpolated value
+ * automatically URI-encoded — e.g. `path\`/agency/byStateAbbr/${state}\``.
+ *
+ * A caller-supplied path segment (dataset ID, filing UUID, state code, ...)
+ * interpolated into a template string without encoding can smuggle in an
+ * extra "/" (reaching an unintended endpoint), "../" (path traversal), or
+ * "?" (injecting query params) — several SDKs used to wrap each such
+ * segment in `encodeURIComponent(...)` by hand at the call site, which is
+ * easy to get right once and easy to forget on the next endpoint added to
+ * the same file. This makes skipping the encoding step impossible: only the
+ * literal template parts pass through untouched, every interpolated value
+ * is always encoded.
+ */
+export function path(strings: TemplateStringsArray, ...values: Array<string | number>): string {
+  return strings.reduce(
+    (acc, str, i) => acc + str + (i < values.length ? encodeURIComponent(String(values[i])) : ""),
+    "",
+  );
 }
 
 // ─── Client Factory ──────────────────────────────────────────────────
@@ -677,14 +728,14 @@ export function createClient(config: ClientConfig): ApiClient {
   return {
     async get<T = unknown>(path: string, params?: Params): Promise<T> {
       const url = buildUrl(path, params);
-      const cacheKey = `${buildCacheKeyUrl(path, params)}||json`;
+      const cacheKey = `${buildCacheKeyUrl(path, params)}|${authCacheFingerprint(resolveAuthParams())}|json`;
       const headers = buildHeaders();
       return request<T>(url, cacheKey, Object.keys(headers).length ? { headers } : undefined);
     },
 
     async getText(path: string, params?: Params): Promise<string> {
       const url = buildUrl(path, params);
-      const cacheKey = `${buildCacheKeyUrl(path, params)}||text`;
+      const cacheKey = `${buildCacheKeyUrl(path, params)}|${authCacheFingerprint(resolveAuthParams())}|text`;
       const headers = buildHeaders();
       return request<string>(url, cacheKey, Object.keys(headers).length ? { headers } : undefined, "text");
     },
@@ -697,7 +748,8 @@ export function createClient(config: ClientConfig): ApiClient {
       const url = buildUrl(path, params);
       // Cache key uses the caller-supplied body only — not `finalBody` below,
       // which may have auth credentials merged in for body-based auth (e.g. BLS).
-      const cacheKey = `${buildCacheKeyUrl(path, params)}|${JSON.stringify(body ?? {})}|json`;
+      const cacheKey =
+        `${buildCacheKeyUrl(path, params)}|${JSON.stringify(body ?? {})}|${authCacheFingerprint(resolveAuthParams())}|json`;
       const headers = buildHeaders({ "Content-Type": "application/json" });
 
       // Auth via body (e.g. BLS)

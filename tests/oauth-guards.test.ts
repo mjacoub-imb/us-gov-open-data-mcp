@@ -147,6 +147,38 @@ describe("POST /oauth/register — upstream credential disclosure (B1)", () => {
     );
     expect(res.status).toBe(413);
   });
+
+  // The size check has to happen WHILE reading the body, not after it's
+  // fully buffered — otherwise the 16KB cap doesn't bound the thing it
+  // appears to, and an unauthenticated caller can force arbitrary memory use
+  // before the 413 is ever produced. A stream that never ends proves this:
+  // the old `c.req.text()` implementation awaits full consumption and would
+  // never resolve, so this test would time out under the pre-fix behavior.
+  it("rejects an oversized body from a stream without waiting for it to end", async () => {
+    const { app } = appWithGuards();
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(1024)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const res = await app.fetch(
+      new Request("http://localhost/oauth/register", {
+        body,
+        // @ts-expect-error -- required by undici for streaming request bodies
+        duplex: "half",
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      }),
+    );
+
+    expect(res.status).toBe(413);
+    expect(cancelled).toBe(true);
+  }, 5_000);
 });
 
 // ─── B2: authorization code exfiltration ──────────────────────────────
