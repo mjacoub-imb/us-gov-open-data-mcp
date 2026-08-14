@@ -23,7 +23,7 @@
  *   - On HTTP 429, wait at least 5 seconds before retrying
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 // ─── Client ──────────────────────────────────────────────────────────
 
@@ -159,7 +159,7 @@ export async function searchApplications(params: {
  */
 export async function getApplication(applicationNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(applicationNumber)}`,
+    path`/api/v1/patent/applications/${applicationNumber}`,
   );
 
   const bag = Array.isArray(res.patentFileWrapperDataBag) ? res.patentFileWrapperDataBag : [];
@@ -171,7 +171,7 @@ export async function getApplication(applicationNumber: string): Promise<Record<
  */
 export async function getApplicationContinuity(applicationNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(applicationNumber)}/continuity`,
+    path`/api/v1/patent/applications/${applicationNumber}/continuity`,
   );
 
   const bag = Array.isArray(res.patentFileWrapperDataBag) ? res.patentFileWrapperDataBag : [];
@@ -183,7 +183,7 @@ export async function getApplicationContinuity(applicationNumber: string): Promi
  */
 export async function getApplicationAssignment(applicationNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(applicationNumber)}/assignment`,
+    path`/api/v1/patent/applications/${applicationNumber}/assignment`,
   );
 
   const bag = Array.isArray(res.patentFileWrapperDataBag) ? res.patentFileWrapperDataBag : [];
@@ -195,7 +195,7 @@ export async function getApplicationAssignment(applicationNumber: string): Promi
  */
 export async function getApplicationTransactions(applicationNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(applicationNumber)}/transactions`,
+    path`/api/v1/patent/applications/${applicationNumber}/transactions`,
   );
 
   const bag = Array.isArray(res.patentFileWrapperDataBag) ? res.patentFileWrapperDataBag : [];
@@ -217,7 +217,7 @@ export async function getApplicationDocuments(params: {
   if (params.officialDateTo) queryParams.officialDateTo = params.officialDateTo;
 
   return api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(params.applicationNumber)}/documents`,
+    path`/api/v1/patent/applications/${params.applicationNumber}/documents`,
     queryParams,
   );
 }
@@ -227,7 +227,7 @@ export async function getApplicationDocuments(params: {
  */
 export async function getApplicationAdjustment(applicationNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(applicationNumber)}/adjustment`,
+    path`/api/v1/patent/applications/${applicationNumber}/adjustment`,
   );
 
   const bag = Array.isArray(res.patentFileWrapperDataBag) ? res.patentFileWrapperDataBag : [];
@@ -239,7 +239,7 @@ export async function getApplicationAdjustment(applicationNumber: string): Promi
  */
 export async function getApplicationForeignPriority(applicationNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(applicationNumber)}/foreign-priority`,
+    path`/api/v1/patent/applications/${applicationNumber}/foreign-priority`,
   );
 
   const bag = Array.isArray(res.patentFileWrapperDataBag) ? res.patentFileWrapperDataBag : [];
@@ -251,7 +251,7 @@ export async function getApplicationForeignPriority(applicationNumber: string): 
  */
 export async function getApplicationAttorney(applicationNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/applications/${encodeURIComponent(applicationNumber)}/attorney`,
+    path`/api/v1/patent/applications/${applicationNumber}/attorney`,
   );
 
   const bag = Array.isArray(res.patentFileWrapperDataBag) ? res.patentFileWrapperDataBag : [];
@@ -288,7 +288,7 @@ export async function searchPtabProceedings(params: {
  */
 export async function getPtabProceeding(trialNumber: string): Promise<Record<string, unknown> | null> {
   const res = await api.get<Record<string, unknown>>(
-    `/api/v1/patent/trials/proceedings/${encodeURIComponent(trialNumber)}`,
+    path`/api/v1/patent/trials/proceedings/${trialNumber}`,
   );
 
   const bag = Array.isArray(res.patentTrialProceedingDataBag) ? res.patentTrialProceedingDataBag : [];

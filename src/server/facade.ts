@@ -23,7 +23,7 @@
 
 import { z } from "zod";
 import type { Tool } from "fastmcp";
-import type { ApiModule } from "../shared/types.js";
+import { DEFAULT_TOOL_ANNOTATIONS, type ApiModule } from "../shared/types.js";
 
 /** Tool surfaces this server can expose. */
 export const TOOL_MODES = ["full", "grouped"] as const;
@@ -133,6 +133,74 @@ export function facadeNamesByModule(groups: FacadeGroup[]): Map<string, string[]
   return map;
 }
 
+/**
+ * Operation (real tool) names actually reachable through a surviving facade,
+ * grouped by module name.
+ *
+ * Distinct from `facadeNamesByModule`: that returns facade *names*; this
+ * returns the underlying *operation* names each module's surviving facades
+ * expose. `instructions.ts` needs both — facade names for the "Tools:" line,
+ * and this for deciding which `workflow`/`tips`/`crossRef` operation
+ * mentions are actually callable versus `code_mode`-only once `FACADES`/
+ * `FACADES_EXCLUDE` has trimmed the surface below module granularity.
+ */
+export function exposedOperationsByModule(groups: FacadeGroup[]): Map<string, Set<string>> {
+  const map = new Map<string, Set<string>>();
+  for (const g of groups) {
+    const set = map.get(g.module.name) ?? new Set<string>();
+    for (const t of g.tools) set.add(t.name);
+    map.set(g.module.name, set);
+  }
+  return map;
+}
+
+/**
+ * Apply an operator-supplied `FACADES` (keep only these) or `FACADES_EXCLUDE`
+ * (drop these) filter to a planned facade list.
+ *
+ * Pulled out of `server.ts` so this decision logic — parsing, case-folding,
+ * rejecting unknown names, rejecting an empty result — is unit-testable
+ * (see "Testing model" in CLAUDE.md: `server.ts` itself has none). Returns an
+ * error string instead of throwing so the caller can print it and
+ * `process.exit(1)` itself, matching this server's existing fail-closed
+ * startup conventions rather than introducing a second error-reporting path.
+ *
+ * Callers are expected to have already rejected supplying both `keep` and
+ * `exclude` at once (that's a CLI-argument concern, not a grouping one) —
+ * this function just takes whichever one is set.
+ */
+export function applyFacadeFilter(
+  groups: FacadeGroup[],
+  opts: { keep?: string; exclude?: string },
+): { kept: FacadeGroup[]; message?: string } | { error: string } {
+  const spec = opts.keep ?? opts.exclude;
+  if (!spec) return { kept: groups };
+
+  const keepOnly = Boolean(opts.keep);
+  const named = new Set(spec.split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+  const available = groups.map(g => g.name);
+
+  // A name matching nothing is a typo or a stale config naming a facade whose
+  // module MODULES no longer loads. Either way the operator's intent is not
+  // what the server would serve, so fail closed instead of quietly diverging.
+  const unmatched = [...named].filter(w => !available.some(a => a.toLowerCase() === w));
+  if (unmatched.length > 0) {
+    return { error: `Unknown facade(s): ${unmatched.join(", ")}. Available: ${available.join(", ")}` };
+  }
+
+  const kept = groups.filter(g => named.has(g.name.toLowerCase()) === keepOnly);
+
+  if (kept.length === 0) {
+    return { error: `No facades left after applying "${spec}". Available: ${available.join(", ")}` };
+  }
+
+  const dropped = groups.length - kept.length;
+  return {
+    kept,
+    message: `Loaded ${kept.length}/${groups.length} facades (dropped ${dropped}): ${kept.map(g => g.name).join(", ")}`,
+  };
+}
+
 function assertNoNameCollisions(modules: ApiModule[], groups: FacadeGroup[]): void {
   const toolNames = new Set(modules.flatMap(m => m.tools.map(t => t.name)));
   const seen = new Set<string>();
@@ -180,10 +248,7 @@ export function buildFacadeTool(group: FacadeGroup): Tool<any, any> {
     description,
     annotations: {
       title: `${mod.displayName}${label ? ` — ${label}` : ""}`,
-      readOnlyHint: true,
-      idempotentHint: true,
-      openWorldHint: true,
-      destructiveHint: false,
+      ...DEFAULT_TOOL_ANNOTATIONS,
     },
     parameters: z.object({
       operation: z
@@ -300,10 +365,22 @@ function toToolName(moduleName: string): string {
  * Tool descriptions are multi-paragraph (they carry examples and field lists);
  * a facade needs enough to route on, not the whole thing — that's where the
  * token savings come from.
+ *
+ * The split requires a lowercase/digit/closing-bracket immediately before the
+ * period and an uppercase letter immediately after the space. Plain "ends
+ * with '. '" is not enough: several module descriptions open with an
+ * abbreviation like "U.S." or "U.K.", where the character before the second
+ * period is itself uppercase — treating that as a sentence boundary produced
+ * facade descriptions that were just "U.S." (bea, cdc, uspto). Requiring a
+ * lowercase/digit/bracket before the period skips those internal periods
+ * without needing a hardcoded abbreviation list.
  */
 function firstSentence(text: string, maxLen: number): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
-  const cut = oneLine.split(/(?<=\.)\s/)[0] ?? oneLine;
+  // The period lives inside the lookbehind (with the char before it) so only
+  // the whitespace is consumed by the split — the period itself stays part
+  // of the retained first sentence instead of being eaten by the match.
+  const cut = oneLine.split(/(?<=[a-z0-9)\]]\.)\s+(?=[A-Z])/)[0] ?? oneLine;
   const chosen = cut.length > maxLen ? cut.slice(0, maxLen).replace(/\s\S*$/, "") + "…" : cut;
   return chosen;
 }

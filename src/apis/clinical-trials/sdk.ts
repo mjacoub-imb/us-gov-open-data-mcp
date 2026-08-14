@@ -14,7 +14,7 @@
  * Docs: https://clinicaltrials.gov/data-api/api
  */
 
-import { createClient, qp } from "../../shared/client.js";
+import { createClient, path, qp } from "../../shared/client.js";
 import type {
   Study,
   PagedStudies,
@@ -163,7 +163,7 @@ export async function getTrialDetail(
   nctId: string,
   opts?: { fields?: string[] },
 ): Promise<Study> {
-  return api.get<Study>(`/studies/${encodeURIComponent(nctId)}`, qp({
+  return api.get<Study>(path`/studies/${nctId}`, qp({
     fields: opts?.fields?.join("|"),
     markupFormat: "markdown",
   }));

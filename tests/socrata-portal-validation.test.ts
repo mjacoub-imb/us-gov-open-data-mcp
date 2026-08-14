@@ -15,7 +15,14 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { assertPortal, isKnownPortal, soqlEscape } from "../src/apis/socrata/sdk.js";
+import {
+  assertPortal,
+  isKnownPortal,
+  MAX_PORTAL_CLIENTS,
+  portal,
+  portalPoolSize,
+  soqlEscape,
+} from "../src/apis/socrata/sdk.js";
 
 afterEach(() => {
   delete process.env.SOCRATA_ALLOW_ANY_PORTAL;
@@ -86,6 +93,23 @@ describe("socrata: assertPortal bypass regressions (SOCRATA_ALLOW_ANY_PORTAL=tru
     expect(() => assertPortal(input)).toThrow();
   });
 
+  // getaddrinfo()-based resolvers (and Node's fetch) accept shorthand dotted
+  // IPv4 forms with fewer than 4 labels — the trailing label absorbs the
+  // remaining octets (inet_aton semantics) — so "127.1" resolves to
+  // 127.0.0.1 and "172.16.1" resolves to 172.16.0.1, same as their 4-label
+  // form. parseIPv4Literal previously required exactly 4 labels, so these
+  // slipped past isPrivateOrReservedHost entirely.
+  it.each([
+    "127.1", // == 127.0.0.1
+    "10.1", // == 10.0.0.1
+    "172.16.1", // == 172.16.0.1
+    "192.168.1", // == 192.168.0.1
+    "0177.1", // octal 127 . 0.0.1
+  ])("still rejects shorthand IPv4 literal %s even when opted in", (input) => {
+    process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
+    expect(() => assertPortal(input)).toThrow();
+  });
+
   it("allows a well-formed public hostname outside the curated list when opted in", () => {
     process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
     expect(assertPortal("data.arizona.gov")).toBe("data.arizona.gov");
@@ -99,6 +123,31 @@ describe("socrata: assertPortal bypass regressions (SOCRATA_ALLOW_ANY_PORTAL=tru
 
   it("rejects non-curated portals by default even without the opt-in", () => {
     expect(() => assertPortal("data.arizona.gov")).toThrow();
+  });
+});
+
+describe("socrata: portal client pool bound (SOCRATA_ALLOW_ANY_PORTAL=true)", () => {
+  // `portal()` builds an ApiClient (and, via createClient, a disk-cache
+  // namespace) per distinct hostname. createClient() itself does no network
+  // I/O — the client only calls out on .get()/.getText()/.post(), which this
+  // test never does — so exercising the real pool here stays network-free.
+  it("never grows the pool past MAX_PORTAL_CLIENTS regardless of how many distinct hosts are requested", () => {
+    process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
+    for (let i = 0; i < MAX_PORTAL_CLIENTS + 25; i++) {
+      portal(`pool-test-${i}.example.com`);
+    }
+    expect(portalPoolSize()).toBeLessThanOrEqual(MAX_PORTAL_CLIENTS);
+  });
+
+  it("evicts an old entry rather than refusing new portals once at capacity", () => {
+    process.env.SOCRATA_ALLOW_ANY_PORTAL = "true";
+    for (let i = 0; i < MAX_PORTAL_CLIENTS + 10; i++) {
+      portal(`pool-fill-${i}.example.com`);
+    }
+    // The pool is at (or was already trimmed to) capacity; requesting one
+    // more distinct host must still succeed by evicting, not throw or hang.
+    expect(() => portal("pool-fill-one-more.example.com")).not.toThrow();
+    expect(portalPoolSize()).toBeLessThanOrEqual(MAX_PORTAL_CLIENTS);
   });
 });
 

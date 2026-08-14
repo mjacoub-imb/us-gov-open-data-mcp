@@ -10,7 +10,7 @@
  *   const data = await getLeadingCausesOfDeath({ state: "New York", year: 2021 });
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 const api = createClient({
   baseUrl: "https://data.cdc.gov/resource",
@@ -54,7 +54,7 @@ export async function queryDataset(datasetId: string, opts: {
   order?: string;    // SODA $order: "year DESC"
   limit?: number;    // max rows (default 1000)
 } = {}): Promise<CdcRecord[]> {
-  return api.get<CdcRecord[]>(`/${encodeURIComponent(datasetId)}.json`, {
+  return api.get<CdcRecord[]>(path`/${datasetId}.json`, {
     "$where": opts.where,
     "$select": opts.select,
     "$group": opts.group,

@@ -13,7 +13,7 @@
  *   const alerts = await getActiveAlerts({ area: "CA" });
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 const USER_AGENT =
   process.env.NWS_USER_AGENT?.trim() ||
@@ -290,7 +290,7 @@ export async function getAlert(id: string): Promise<Alert | null> {
   // Be forgiving: if a caller passes the full URL form, strip the prefix.
   const urn = id.replace(/^https?:\/\/api\.weather\.gov\/alerts\//, "");
   try {
-    const data = await api.get<Feature<any>>(`/alerts/${encodeURIComponent(urn)}`);
+    const data = await api.get<Feature<any>>(path`/alerts/${urn}`);
     if (!data.properties) return null;
     return mapAlert({ id: data.id ?? urn, properties: data.properties });
   } catch (e) {

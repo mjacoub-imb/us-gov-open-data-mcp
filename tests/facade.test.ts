@@ -14,8 +14,10 @@ import { describe, it, expect } from "vitest";
 import { z } from "zod";
 import {
   TOOL_MODES,
+  applyFacadeFilter,
   buildFacadeTool,
   buildGroupedTools,
+  exposedOperationsByModule,
   facadeNamesByModule,
   planFacades,
   validateToolArgs,
@@ -164,6 +166,99 @@ describe("planFacades — splits", () => {
   });
 });
 
+// ─── Filtering the grouped surface (FACADES / FACADES_EXCLUDE) ────────
+
+describe("exposedOperationsByModule", () => {
+  it("includes every operation of a module with no FACADES filter applied", () => {
+    const fred = realModules.find(m => m.name === "fred");
+    if (!fred) return;
+
+    const map = exposedOperationsByModule(planFacades([fred]));
+    const exposed = map.get("fred");
+    expect(exposed?.size).toBe(fred.tools.length);
+    for (const t of fred.tools) expect(exposed?.has(t.name)).toBe(true);
+  });
+
+  it("shrinks to only the surviving facades' operations once one is filtered out", () => {
+    const congress = realModules.find(m => m.name === "congress");
+    if (!congress) return;
+
+    const groups = planFacades([congress]);
+    const withoutMembers = groups.filter(g => g.name !== "congress_members");
+    const map = exposedOperationsByModule(withoutMembers);
+    const exposed = map.get("congress")!;
+
+    expect(exposed.has("congress_search_bills")).toBe(true); // survives in congress_bills
+    expect(exposed.has("congress_house_votes")).toBe(false); // was only in congress_members
+    expect(exposed.size).toBeLessThan(congress.tools.length);
+  });
+});
+
+describe("applyFacadeFilter", () => {
+  const fred = realModules.find(m => m.name === "fred");
+  const groups = fred ? planFacades([fred]) : [];
+
+  it("is a no-op when neither keep nor exclude is given", () => {
+    if (!fred) return;
+    const result = applyFacadeFilter(groups, {});
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.kept).toBe(groups); // same reference — nothing filtered
+    expect(result.message).toBeUndefined();
+  });
+
+  it("keep: retains only the named facades", () => {
+    const congress = realModules.find(m => m.name === "congress");
+    if (!congress) return;
+    const congressGroups = planFacades([congress]);
+
+    const result = applyFacadeFilter(congressGroups, { keep: "congress_bills" });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.kept.map(g => g.name)).toEqual(["congress_bills"]);
+    expect(result.message).toContain("dropped 4");
+  });
+
+  it("exclude: drops only the named facades", () => {
+    const congress = realModules.find(m => m.name === "congress");
+    if (!congress) return;
+    const congressGroups = planFacades([congress]);
+
+    const result = applyFacadeFilter(congressGroups, { exclude: "congress_members,congress_records" });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    const names = result.kept.map(g => g.name);
+    expect(names).not.toContain("congress_members");
+    expect(names).not.toContain("congress_records");
+    expect(names).toContain("congress_bills");
+  });
+
+  it("is case-insensitive on facade names", () => {
+    if (!fred) return;
+    const result = applyFacadeFilter(groups, { keep: "FRED" });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.kept.map(g => g.name)).toEqual(["fred"]);
+  });
+
+  it("fails closed on an unknown facade name instead of silently ignoring it", () => {
+    if (!fred) return;
+    const result = applyFacadeFilter(groups, { keep: "not_a_real_facade" });
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toContain("Unknown facade");
+    expect(result.error).toContain("not_a_real_facade");
+  });
+
+  it("fails closed rather than serving an empty surface", () => {
+    if (!fred) return;
+    const result = applyFacadeFilter(groups, { exclude: "fred" });
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toContain("No facades left");
+  });
+});
+
 // ─── Facade description ───────────────────────────────────────────────
 
 describe("buildFacadeTool — description", () => {
@@ -190,6 +285,24 @@ describe("buildFacadeTool — description", () => {
 
   it("says no key required for keyless modules", () => {
     expect(facadeFor(fakeModule()).description).toContain("No API key required");
+  });
+
+  it("does not treat a dotted abbreviation like 'U.S.' as a sentence boundary", () => {
+    // Regression: a naive ". "-split truncated bea/cdc/uspto/nws's facade
+    // descriptions down to just "U.S." because the character before the
+    // second period ("S") is itself uppercase, same shape as any sentence
+    // start — the description lost everything after the abbreviation.
+    const facade = facadeFor(
+      fakeModule({ description: "U.S. economic statistics and trade data. Second real sentence dropped." }),
+    );
+    expect(facade.description).toContain("U.S. economic statistics and trade data.");
+    expect(facade.description).not.toContain("Second real sentence dropped");
+  });
+
+  it("still finds the real sentence boundary that follows a leading abbreviation", () => {
+    const facade = facadeFor(fakeModule({ description: "U.S. Patent Office data. Covers applications and grants." }));
+    expect(facade.description).toContain("U.S. Patent Office data.");
+    expect(facade.description).not.toContain("Covers applications");
   });
 });
 

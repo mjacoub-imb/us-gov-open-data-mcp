@@ -12,7 +12,8 @@
  * No auth required; optional SOCRATA_APP_TOKEN raises the per-portal rate limit.
  */
 
-import { createClient, type ApiClient } from "../../shared/client.js";
+import { createClient, path, type ApiClient } from "../../shared/client.js";
+import { isPrivateOrReservedHost, normalizeHostname as normalizeHostnameShared } from "../../shared/ssrf.js";
 
 // ─── Known portals (probe-verified — NOT every state runs Socrata) ────
 
@@ -97,8 +98,6 @@ export interface DatasetColumn {
 // only at request time — is NOT covered; that requires validating the
 // resolved address at connect time, not just the hostname string).
 
-const HOSTNAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
-
 const KNOWN_PORTALS = new Set<string>(
   [...Object.values(STATE_PORTALS), ...Object.values(CITY_PORTALS), ...Object.values(FEDERAL_PORTALS)]
     .map(d => d.toLowerCase()),
@@ -111,53 +110,7 @@ function allowAnyPortal(): boolean {
 }
 
 function normalizeHostname(domain: string): string {
-  const d = domain.trim().toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/.*$/, "")
-    .replace(/:\d+$/, "");
-  if (!d || !HOSTNAME_RE.test(d) || d.includes("@")) {
-    throw new Error(`socrata: "${domain}" doesn't look like a valid portal hostname (expected e.g. "data.ny.gov")`);
-  }
-  return d;
-}
-
-/**
- * Parse a hostname as an IPv4 literal, honoring legacy inet_aton radix rules
- * (leading "0x" = hex, leading "0" = octal) that some resolvers still accept
- * and that string-prefix denylists silently miss (e.g. "0177.0.0.1" === 127.0.0.1).
- * Returns the four octets, or null if `host` isn't an all-numeric dotted quad.
- */
-function parseIPv4Literal(host: string): [number, number, number, number] | null {
-  const labels = host.split(".");
-  if (labels.length !== 4) return null;
-  const octets: number[] = [];
-  for (const label of labels) {
-    // Number()/parseInt() with an implicit radix both read "0177" as decimal
-    // 177, not octal 127 — the radix has to be picked explicitly per prefix,
-    // or the octal/hex forms this function exists to catch parse as the
-    // wrong (non-matching, so falsely "safe") value.
-    let n: number;
-    if (/^0x[0-9a-f]+$/i.test(label)) n = parseInt(label, 16);
-    else if (/^0[0-7]+$/.test(label)) n = parseInt(label, 8);
-    else if (/^[0-9]+$/.test(label)) n = parseInt(label, 10);
-    else return null;
-    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
-    octets.push(n);
-  }
-  return octets as [number, number, number, number];
-}
-
-function isPrivateOrReservedHost(host: string): boolean {
-  if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal")) return true;
-  const ip = parseIPv4Literal(host);
-  if (!ip) return false;
-  const [a, b] = ip;
-  return (
-    a === 0 || a === 127 || a === 10 ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 169 && b === 254)
-  );
+  return normalizeHostnameShared(domain, { label: "socrata", noun: "portal hostname", example: "data.ny.gov" });
 }
 
 /** True only for portals on the curated allowlist — the only ones that get SOCRATA_APP_TOKEN attached. */
@@ -189,12 +142,44 @@ export function soqlEscape(value: string | number): string {
 
 // ─── Per-portal client pool ──────────────────────────────────────────────
 
+/**
+ * Max distinct portal hostnames pooled at once. Comfortably above the ~25
+ * curated portals (STATE_PORTALS + CITY_PORTALS + FEDERAL_PORTALS), so normal
+ * usage never evicts anything. Exists for SOCRATA_ALLOW_ANY_PORTAL: without a
+ * cap, a caller varying the `domain` argument across many distinct hostnames
+ * would grow this Map — and, via createClient's disk-cache namespace per
+ * `name`, a same-shaped cache.json namespace per hostname — without bound.
+ */
+export const MAX_PORTAL_CLIENTS = 100;
+
 const portalClients = new Map<string, ApiClient>();
 
-function portal(domain: string): ApiClient {
+/** Exposed for tests/socrata-portal-validation.test.ts (pool-bound + eviction coverage). */
+export function portalPoolSize(): number {
+  return portalClients.size;
+}
+
+export function portal(domain: string): ApiClient {
   const d = assertPortal(domain);
   let client = portalClients.get(d);
   if (!client) {
+    if (portalClients.size >= MAX_PORTAL_CLIENTS) {
+      // Map preserves insertion order, so the first key is the
+      // longest-untouched entry (`portalClients.delete`+`.set` on repeat
+      // access would make this a true LRU, but this pool sees traffic
+      // concentrated on the curated portals that stay well under the cap —
+      // eviction only fires under sustained use of many distinct
+      // SOCRATA_ALLOW_ANY_PORTAL hosts, where "oldest inserted" is an
+      // adequate proxy for "least likely still in use"). Clear its disk
+      // cache too, not just the in-memory client wrapper — otherwise the
+      // per-portal cache.json namespace outlives the pool eviction and the
+      // Map cap doesn't actually bound the memory it exists to bound.
+      const oldest = portalClients.keys().next().value;
+      if (oldest !== undefined) {
+        portalClients.get(oldest)?.clearCache();
+        portalClients.delete(oldest);
+      }
+    }
     client = createClient({
       baseUrl: `https://${d}`,
       name: `socrata:${d}`,
@@ -267,7 +252,7 @@ export async function getDatasetColumns(domain: string, datasetId: string): Prom
   columns: DatasetColumn[];
 }> {
   const client = portal(domain);
-  const raw = await client.get<any>(`/api/views/${encodeURIComponent(datasetId)}.json`);
+  const raw = await client.get<any>(path`/api/views/${datasetId}.json`);
   const columns: DatasetColumn[] = (raw.columns ?? []).map((c: any) => ({
     fieldName: c.fieldName,
     name: c.name,
@@ -289,7 +274,7 @@ export async function queryDataset(domain: string, datasetId: string, opts: {
   q?: string;         // full-text search across the dataset
 } = {}): Promise<SocrataRecord[]> {
   const client = portal(domain);
-  return client.get<SocrataRecord[]>(`/resource/${encodeURIComponent(datasetId)}.json`, {
+  return client.get<SocrataRecord[]>(path`/resource/${datasetId}.json`, {
     "$select": opts.select,
     "$where": opts.where,
     "$group": opts.group,

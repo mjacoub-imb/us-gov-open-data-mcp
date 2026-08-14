@@ -97,6 +97,53 @@ describe("buildInstructions", () => {
     expect(econIdx).toBeLessThan(housingIdx);
   });
 
+  // A question type like "state-level" or "spending/budget" can accumulate
+  // 20+ contributing modules, concatenated into one long "+"-joined line.
+  // A module whose route is the ONLY correct answer for a meaningfully
+  // different sub-case (e.g. socrata is the only source for STATE agency
+  // budgets, as opposed to the dozen federal-spending modules also in that
+  // bucket) needs to stand out from that wall of text rather than being
+  // buried at whatever position module-iteration order happens to put it.
+  it("highlights a primary crossRef hint ahead of non-primary hints in the same question type", () => {
+    const socrataLike = mockModule({
+      name: "socrata",
+      displayName: "Socrata",
+      crossRef: [{ question: "spending/budget", route: "socrata_query — the ONLY source for STATE budgets", primary: true }],
+    });
+    const treasury = mockModule({
+      name: "treasury",
+      displayName: "Treasury",
+      crossRef: [{ question: "spending/budget", route: "query_fiscal_data" }],
+    });
+    const fred = mockModule({
+      name: "fred",
+      displayName: "FRED",
+      crossRef: [{ question: "spending/budget", route: "FYFSGDA188S" }],
+    });
+    const result = buildInstructions([treasury, fred, socrataLike]);
+
+    expect(result).toContain(
+      "SPENDING/BUDGET → START HERE: Socrata(socrata_query — the ONLY source for STATE budgets) | Also: Treasury(query_fiscal_data) + FRED(FYFSGDA188S)",
+    );
+  });
+
+  it("uses the plain '+'-joined format when no hint in a question type is primary", () => {
+    const fred = mockModule({
+      name: "fred",
+      displayName: "FRED",
+      crossRef: [{ question: "spending/budget", route: "FYFSGDA188S" }],
+    });
+    const treasury = mockModule({
+      name: "treasury",
+      displayName: "Treasury",
+      crossRef: [{ question: "spending/budget", route: "query_fiscal_data" }],
+    });
+    const result = buildInstructions([fred, treasury]);
+
+    expect(result).toContain("SPENDING/BUDGET → FRED(FYFSGDA188S) + Treasury(query_fiscal_data)");
+    expect(result).not.toContain("START HERE");
+  });
+
   it("skips empty question types", () => {
     const mod = mockModule({ crossRef: [{ question: "economy", route: "GDP" }] });
     const result = buildInstructions([mod]);
@@ -130,6 +177,81 @@ describe("buildInstructions", () => {
     const result = buildInstructions([]);
     expect(typeof result).toBe("string");
     expect(result.length).toBeGreaterThan(0);
+  });
+});
+
+// ─── Grouped mode: facadesByModule / exposedOpsByModule ───────────────
+//
+// Regression coverage for the bug where FACADES_EXCLUDE trimmed the
+// registered tool surface but buildInstructions kept advertising every
+// module's original tool names as directly callable — verified live against
+// the production Dockerfile config, where the instructions told the model to
+// call operations no registered facade could reach.
+
+describe("buildInstructions — grouped mode with a partially trimmed module", () => {
+  it("names only the surviving facade on the Tools: line, not raw tool names", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map([["test-mod", ["test_mod_facade"]]]),
+      exposedOpsByModule: new Map([["test-mod", new Set(["test_search", "test_data"])]]),
+    });
+    expect(result).toContain("Tools: test_mod_facade (operations below are called through these)");
+  });
+
+  it("lists operations hidden by FACADES_EXCLUDE and points them at code_mode", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map([["test-mod", ["test_mod_facade"]]]),
+      // Only test_search survived; test_data's facade was excluded.
+      exposedOpsByModule: new Map([["test-mod", new Set(["test_search"])]]),
+    });
+    expect(result).toContain("Not exposed as operations in this deployment");
+    expect(result).toContain("code_mode");
+    expect(result).toContain("test_data");
+    // The surviving operation must not be listed as hidden.
+    const hiddenLine = result.split("\n").find(l => l.includes("Not exposed as operations"));
+    expect(hiddenLine).toBeDefined();
+    expect(hiddenLine).not.toContain("test_search");
+  });
+
+  it("adds no hidden-operations note when every operation survives", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map([["test-mod", ["test_mod_facade"]]]),
+      exposedOpsByModule: new Map([["test-mod", new Set(["test_search", "test_data"])]]),
+    });
+    expect(result).not.toContain("Not exposed as operations");
+  });
+});
+
+describe("buildInstructions — grouped mode with a module fully excluded (every facade dropped)", () => {
+  it("does not fall back to the full-mode Tools: line implying the tools are directly callable", () => {
+    const mod = mockModule();
+    // facadesByModule has no entry for "test-mod" at all — every one of its
+    // facades was excluded, distinct from grouped mode being off.
+    const result = buildInstructions([mod], {
+      facadesByModule: new Map(),
+      exposedOpsByModule: new Map(),
+    });
+    // The bug: this used to render exactly "Tools: test_search, test_data",
+    // identical to full (ungrouped) mode's line — implying both names are
+    // directly callable tools, when in this deployment neither is registered
+    // as anything.
+    expect(result).not.toContain("Tools: test_search, test_data");
+    expect(result).toContain("none registered in this deployment");
+    expect(result).toContain("code_mode");
+    expect(result).toContain("test_search");
+    expect(result).toContain("test_data");
+  });
+});
+
+describe("buildInstructions — full mode (no facadesByModule) is unaffected", () => {
+  it("still lists raw tool names directly, with no hidden-operations note", () => {
+    const mod = mockModule();
+    const result = buildInstructions([mod]);
+    expect(result).toContain("Tools: test_search, test_data");
+    expect(result).not.toContain("Not exposed as operations");
+    expect(result).not.toContain("none registered in this deployment");
   });
 });
 
@@ -191,6 +313,23 @@ describe("Routing table coverage", () => {
 
     const uncovered = QUESTION_TYPES.filter(q => !coveredQuestions.has(q));
     expect(uncovered, `Uncovered question types: ${uncovered.join(", ")}`).toHaveLength(0);
+  });
+
+  // Regression guard: socrata is the only module reaching arbitrary
+  // state/local government datasets and STATE agency budgets, but
+  // "state-level" and "spending/budget" each have 10-20+ other contributing
+  // modules (mostly federal or federally-disaggregated data). Without
+  // `primary`, socrata's hint gets buried in that "+"-joined line and the
+  // model reliably misses it for questions only socrata can answer.
+  it("socrata's state-level and spending/budget hints stay marked primary", () => {
+    const socrata = allModules.find(m => m.name === "socrata");
+    expect(socrata, "socrata module not found").toBeDefined();
+
+    for (const question of ["state-level", "spending/budget"]) {
+      const hint = socrata!.crossRef?.find(h => h.question === question);
+      expect(hint, `socrata: no crossRef hint for "${question}"`).toBeDefined();
+      expect(hint!.primary, `socrata: "${question}" hint should be primary`).toBe(true);
+    }
   });
 });
 

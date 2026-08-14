@@ -9,7 +9,7 @@
  * Docs: https://www.fema.gov/about/openfema/api
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 // ─── Client ──────────────────────────────────────────────────────────
 
@@ -300,7 +300,7 @@ export async function queryDataset(opts: {
   if (opts.orderBy) params.$orderby = opts.orderBy;
   if (opts.skip) params.$skip = String(opts.skip);
 
-  const res = await api.get(`/${encodeURIComponent(endpoint)}`, params);
+  const res = await api.get(path`/${endpoint}`, params);
   return extractArray<unknown>(res, endpoint);
 }
 

@@ -51,11 +51,48 @@ export interface OAuthProxyLike {
 /** Max size of a DCR request body we'll parse (registration metadata is small). */
 const MAX_DCR_BODY_BYTES = 16 * 1024;
 
+/** Thrown by `readBodyCapped` when the stream exceeds its byte cap. */
+class BodyTooLargeError extends Error {}
+
+/**
+ * Read a request body as text, enforcing `maxBytes` WHILE reading rather
+ * than after fully buffering it. `/oauth/register` is unauthenticated, so
+ * checking `.length` only after `req.text()` resolves doesn't bound
+ * anything — the whole body is already in memory by then, and a caller
+ * sending gigabytes (or a body that never ends) would be read in full
+ * before the cap ever applies.
+ */
+async function readBodyCapped(body: ReadableStream<Uint8Array> | null, maxBytes: number): Promise<string> {
+  if (!body) return "";
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new BodyTooLargeError();
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  text += decoder.decode();
+  return text;
+}
+
 function oauthError(error: string, description: string, status = 400): Response {
   return new Response(JSON.stringify({ error, error_description: description }), {
     headers: { "Content-Type": "application/json" },
     status,
   });
+}
+
+/** Pull a numeric `statusCode` off a thrown error, falling back when absent or non-numeric. */
+function statusFrom(err: unknown, fallback = 400): number {
+  const status = (err as { statusCode?: unknown })?.statusCode;
+  return typeof status === "number" ? status : fallback;
 }
 
 /**
@@ -79,12 +116,12 @@ export function registerOAuthGuards(
   app.post("/oauth/register", async c => {
     let body: Record<string, unknown>;
     try {
-      const raw = await c.req.text();
-      if (raw.length > MAX_DCR_BODY_BYTES) {
+      const raw = await readBodyCapped(c.req.raw.body, MAX_DCR_BODY_BYTES);
+      body = JSON.parse(raw || "{}") as Record<string, unknown>;
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
         return oauthError("invalid_client_metadata", "Registration request too large.", 413);
       }
-      body = JSON.parse(raw || "{}") as Record<string, unknown>;
-    } catch {
       return oauthError("invalid_client_metadata", "Request body must be valid JSON.");
     }
 
@@ -104,10 +141,7 @@ export function registerOAuthGuards(
     try {
       registration = await proxy.registerClient(body);
     } catch (err) {
-      const status = typeof (err as { statusCode?: number })?.statusCode === "number"
-        ? (err as { statusCode: number }).statusCode
-        : 400;
-      return oauthError("invalid_client_metadata", (err as Error)?.message ?? "Registration failed.", status);
+      return oauthError("invalid_client_metadata", (err as Error)?.message ?? "Registration failed.", statusFrom(err));
     }
 
     // The whole point of this shim: never return the upstream app's secret.
@@ -162,13 +196,10 @@ export function registerOAuthGuards(
         },
       );
     } catch (err) {
-      const status = typeof (err as { statusCode?: number })?.statusCode === "number"
-        ? (err as { statusCode: number }).statusCode
-        : 400;
       return oauthError(
         (err as { code?: string })?.code ?? "invalid_request",
         (err as Error)?.message ?? "Authorization failed.",
-        status,
+        statusFrom(err),
       );
     }
   });

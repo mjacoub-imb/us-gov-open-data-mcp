@@ -9,7 +9,7 @@
  * Docs: https://www.federalregister.gov/developers/documentation/api/v1
  */
 
-import { createClient } from "../../shared/client.js";
+import { createClient, path } from "../../shared/client.js";
 
 // ─── Client ──────────────────────────────────────────────────────────
 
@@ -167,7 +167,7 @@ export async function searchRules(opts: {
  *   const doc = await getDocumentDetail('2024-00001');
  */
 export async function getDocumentDetail(documentNumber: string): Promise<FRDocument> {
-  return api.get<FRDocument>(`/documents/${encodeURIComponent(documentNumber)}.json`);
+  return api.get<FRDocument>(path`/documents/${documentNumber}.json`);
 }
 
 /**
