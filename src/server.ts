@@ -300,6 +300,14 @@ const azureProvider = authConfig.oauth
       clientId: authConfig.oauth.clientId,
       clientSecret: authConfig.oauth.clientSecret,
       tenantId: authConfig.oauth.tenantId,
+      // Azure's default scopes (openid, profile, email) get no refresh token
+      // from Entra, so every access token expiry (~1hr) forces a full
+      // re-authorization instead of a silent refresh. offline_access is what
+      // makes Entra issue one.
+      scopes: ["openid", "profile", "email", "offline_access"],
+      // The upstream Entra consent screen already asks the user to approve
+      // access; this skips fastmcp's own separate consent page on top of it.
+      consentRequired: false,
       ...(authConfig.oauth.encryptionKey && { encryptionKey: authConfig.oauth.encryptionKey }),
       ...(authConfig.oauth.jwtSigningKey && { jwtSigningKey: authConfig.oauth.jwtSigningKey }),
     })
