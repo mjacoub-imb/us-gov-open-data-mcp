@@ -12,8 +12,11 @@ import { describe, it, expect } from "vitest";
 import type { IncomingMessage } from "node:http";
 import {
   createAuthenticator,
+  extractIdTokenEmail,
   extractPresentedToken,
   isAllowedRedirectUri,
+  isEmailDomainAllowed,
+  parseAllowedEmailDomains,
   resolveAuthConfig,
   safeTokenEqual,
   validatePublicUrl,
@@ -43,6 +46,12 @@ function validOAuthEnv(overrides: AuthEnv = {}): AuthEnv {
 /** Minimal IncomingMessage stand-in — only the fields the code reads. */
 function req(headers: Record<string, string | string[]> = {}, url = "/mcp"): IncomingMessage {
   return { headers, url } as unknown as IncomingMessage;
+}
+
+/** An unsigned JWT-shaped string carrying the given payload — signature is never checked. */
+function fakeIdToken(payload: Record<string, unknown>): string {
+  const encode = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode(payload)}.sig`;
 }
 
 function errorsOf(result: ReturnType<typeof resolveAuthConfig>): string[] {
@@ -170,6 +179,66 @@ describe("isAllowedRedirectUri", () => {
   it("rejects empty and unparseable input", () => {
     expect(isAllowedRedirectUri("", DEFAULT_REDIRECT_ALLOWLIST)).toBe(false);
     expect(isAllowedRedirectUri("://nope", DEFAULT_REDIRECT_ALLOWLIST)).toBe(false);
+  });
+});
+
+// ─── Email-domain allowlist ────────────────────────────────────────────
+
+describe("parseAllowedEmailDomains", () => {
+  it("lowercases, trims, strips a leading @, and drops empties", () => {
+    expect(parseAllowedEmailDomains(" IMBPartners.com, @Contoso.com ,, "))
+      .toEqual(["imbpartners.com", "contoso.com"]);
+  });
+
+  it("returns an empty list for unset or blank input", () => {
+    expect(parseAllowedEmailDomains(undefined)).toEqual([]);
+    expect(parseAllowedEmailDomains("")).toEqual([]);
+    expect(parseAllowedEmailDomains("   ")).toEqual([]);
+  });
+});
+
+describe("extractIdTokenEmail", () => {
+  it("reads the email claim, lowercased", () => {
+    expect(extractIdTokenEmail(fakeIdToken({ email: "Mark@IMBPartners.com" }))).toBe("mark@imbpartners.com");
+  });
+
+  it("falls back to preferred_username, then upn, when email is absent", () => {
+    expect(extractIdTokenEmail(fakeIdToken({ preferred_username: "mark@imbpartners.com" })))
+      .toBe("mark@imbpartners.com");
+    expect(extractIdTokenEmail(fakeIdToken({ upn: "mark@imbpartners.com" }))).toBe("mark@imbpartners.com");
+  });
+
+  it("prefers email over preferred_username/upn when more than one claim is present", () => {
+    expect(extractIdTokenEmail(fakeIdToken({
+      email: "mark@imbpartners.com",
+      upn: "someone-else@imbpartners.com",
+    }))).toBe("mark@imbpartners.com");
+  });
+
+  it("returns undefined for missing, malformed, or claim-less tokens", () => {
+    expect(extractIdTokenEmail(undefined)).toBeUndefined();
+    expect(extractIdTokenEmail("not-a-jwt")).toBeUndefined();
+    expect(extractIdTokenEmail("only.two")).toBeUndefined();
+    expect(extractIdTokenEmail(fakeIdToken({ sub: "no-email-claim-here" }))).toBeUndefined();
+    expect(extractIdTokenEmail(fakeIdToken({ email: "not-an-email" }))).toBeUndefined();
+  });
+});
+
+describe("isEmailDomainAllowed", () => {
+  it("allows anything when no allowlist is configured", () => {
+    expect(isEmailDomainAllowed(undefined, [])).toBe(true);
+    expect(isEmailDomainAllowed("anyone@anywhere.example", [])).toBe(true);
+  });
+
+  it("allows a matching domain and rejects a non-matching one", () => {
+    expect(isEmailDomainAllowed("mark@imbpartners.com", ["imbpartners.com"])).toBe(true);
+    expect(isEmailDomainAllowed("mark@other.example", ["imbpartners.com"])).toBe(false);
+  });
+
+  // Fail closed: an allowlist is configured but we couldn't determine an
+  // identity to check it against — that must reject, never silently admit.
+  it("rejects when an allowlist is configured but no email could be determined", () => {
+    expect(isEmailDomainAllowed(undefined, ["imbpartners.com"])).toBe(false);
   });
 });
 
@@ -339,6 +408,27 @@ describe("resolveAuthConfig", () => {
         expect(result.config.oauth).toBeDefined();
       }
     });
+
+    it("defaults to no email-domain restriction and warns about it", () => {
+      const result = resolveAuthConfig(validOAuthEnv(), "httpStream");
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.config.oauth?.allowedEmailDomains).toEqual([]);
+        expect(result.config.warnings.join(" ")).toMatch(/MCP_OAUTH_ALLOWED_EMAIL_DOMAINS is not set/i);
+      }
+    });
+
+    it("parses a configured email-domain allowlist and does not warn", () => {
+      const result = resolveAuthConfig(
+        validOAuthEnv({ MCP_OAUTH_ALLOWED_EMAIL_DOMAINS: "imbpartners.com, @Contoso.com" }),
+        "httpStream",
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.config.oauth?.allowedEmailDomains).toEqual(["imbpartners.com", "contoso.com"]);
+        expect(result.config.warnings.join(" ")).not.toMatch(/MCP_OAUTH_ALLOWED_EMAIL_DOMAINS/i);
+      }
+    });
   });
 
   describe("httpStream — MCP_AUTH_MODE", () => {
@@ -498,5 +588,43 @@ describe("createAuthenticator", () => {
   it("rejects an undefined request when a credential is required", async () => {
     const auth = createAuthenticator({ staticToken: GOOD_TOKEN });
     await expect401(() => auth(undefined));
+  });
+
+  // ─── Email-domain allowlist ──────────────────────────────────────────
+
+  async function expect403(fn: () => Promise<unknown>): Promise<void> {
+    await expect(fn()).rejects.toMatchObject({ status: 403 });
+  }
+
+  it("admits an OAuth session whose email matches the allowlist", async () => {
+    const provider = delegate({ accessToken: "upstream", idToken: fakeIdToken({ email: "mark@imbpartners.com" }) });
+    const auth = createAuthenticator({ allowedEmailDomains: ["imbpartners.com"], oauthProvider: provider });
+    await expect(auth(req({ authorization: "Bearer some-oauth-jwt" })))
+      .resolves.toMatchObject({ authenticated: true, method: "oauth" });
+  });
+
+  it("FORBIDS (403, not 401) an otherwise-valid OAuth session outside the allowlist", async () => {
+    const provider = delegate({ accessToken: "upstream", idToken: fakeIdToken({ email: "guest@other.example" }) });
+    const auth = createAuthenticator({ allowedEmailDomains: ["imbpartners.com"], oauthProvider: provider });
+    await expect403(() => auth(req({ authorization: "Bearer some-oauth-jwt" })));
+  });
+
+  it("forbids an OAuth session with no idToken/email when an allowlist is configured (fails closed)", async () => {
+    const provider = delegate({ accessToken: "upstream" });
+    const auth = createAuthenticator({ allowedEmailDomains: ["imbpartners.com"], oauthProvider: provider });
+    await expect403(() => auth(req({ authorization: "Bearer some-oauth-jwt" })));
+  });
+
+  it("does not restrict OAuth sessions when no allowlist is configured", async () => {
+    const provider = delegate({ accessToken: "upstream", idToken: fakeIdToken({ email: "anyone@anywhere.example" }) });
+    const auth = createAuthenticator({ oauthProvider: provider });
+    await expect(auth(req({ authorization: "Bearer some-oauth-jwt" })))
+      .resolves.toMatchObject({ authenticated: true, method: "oauth" });
+  });
+
+  it("lets the static token in even when an email allowlist is configured", async () => {
+    const auth = createAuthenticator({ allowedEmailDomains: ["imbpartners.com"], staticToken: GOOD_TOKEN });
+    await expect(auth(req({ authorization: `Bearer ${GOOD_TOKEN}` })))
+      .resolves.toMatchObject({ authenticated: true, method: "static" });
   });
 });

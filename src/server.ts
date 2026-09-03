@@ -327,6 +327,7 @@ const server = new FastMCP({
   ...(azureProvider && { auth: azureProvider }),
   ...(transport === "httpStream" && {
     authenticate: createAuthenticator({
+      allowedEmailDomains: authConfig.oauth?.allowedEmailDomains,
       allowQueryToken: authConfig.allowQueryToken,
       oauthProvider: azureProvider,
       staticToken: authConfig.staticToken,
