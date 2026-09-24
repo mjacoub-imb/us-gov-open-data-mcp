@@ -707,7 +707,14 @@ export function createClient(config: ClientConfig): ApiClient {
       }
 
       const bodyText = await readBodyCapped(res, MAX_RESPONSE_BYTES);
-      const data = JSON.parse(bodyText);
+      // Some upstreams (e.g. Census, for a `for=` geography they don't
+      // recognize) answer a zero-row match with HTTP 200/204 and a
+      // genuinely empty body instead of a 4xx. JSON.parse("") throws
+      // "Unexpected end of JSON input" — treat empty as `{}` instead so
+      // callers' existing `res.foo ?? []` / `Array.isArray(res)` checks
+      // produce their normal "no data" response rather than a raw parse
+      // error.
+      const data = bodyText.trim() === "" ? {} : JSON.parse(bodyText);
 
       // Check for API-level errors in body
       if (checkError) {
