@@ -32,6 +32,8 @@ export interface OAuthSettings {
   /** Redirect URIs permitted to receive an authorization code. */
   redirectAllowlist: string[];
   tenantId: string;
+  /** Lowercase domains (no leading "@") allowed to sign in. Empty = any account in the tenant. */
+  allowedEmailDomains: string[];
   encryptionKey?: string;
   jwtSigningKey?: string;
 }
@@ -201,6 +203,49 @@ export function isAllowedRedirectUri(uri: string, allowlist: string[]): boolean 
   return false;
 }
 
+// ─── Email-domain allowlist ──────────────────────────────────────────
+
+/** "imbpartners.com, @Contoso.com , " -> ["imbpartners.com", "contoso.com"] */
+export function parseAllowedEmailDomains(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map(s => s.trim().toLowerCase().replace(/^@/, ""))
+    .filter(Boolean);
+}
+
+/**
+ * Pull an email-like claim out of an Entra ID token, without verifying its
+ * signature. That's safe here because this token was never attacker-supplied
+ * input: it was fetched directly from Microsoft's token endpoint by our own
+ * server-to-server exchange (client-secret authenticated, over TLS) and
+ * handed back to us by fastmcp's OAuthProxy from its own token storage.
+ * Decoding it locally only saves a redundant JWKS round trip.
+ */
+export function extractIdTokenEmail(idToken: string | undefined): string | undefined {
+  if (!idToken) return undefined;
+  const parts = idToken.split(".");
+  if (parts.length !== 3) return undefined;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
+    // preferred_username/upn fall back for work accounts where "email" isn't set.
+    const candidate = payload.email ?? payload.preferred_username ?? payload.upn;
+    return typeof candidate === "string" && candidate.includes("@") ? candidate.trim().toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Empty allowlist = no restriction (any account in the configured tenant).
+ * Otherwise fails closed: an email we couldn't extract is never allowed.
+ */
+export function isEmailDomainAllowed(email: string | undefined, allowedDomains: string[]): boolean {
+  if (allowedDomains.length === 0) return true;
+  if (!email) return false;
+  const domain = email.slice(email.lastIndexOf("@") + 1);
+  return allowedDomains.includes(domain);
+}
+
 // ─── Token extraction ────────────────────────────────────────────────
 
 /**
@@ -337,12 +382,15 @@ export function resolveAuthConfig(env: AuthEnv, transport: string): AuthResoluti
       .map(s => s.trim())
       .filter(Boolean);
 
+    const allowedEmailDomains = parseAllowedEmailDomains(env.MCP_OAUTH_ALLOWED_EMAIL_DOMAINS);
+
     if (
       missing.length === 0 &&
       "value" in tenant &&
       "value" in publicUrl
     ) {
       oauth = {
+        allowedEmailDomains,
         clientId: azureVars.AZURE_CLIENT_ID,
         clientSecret: azureVars.AZURE_CLIENT_SECRET,
         encryptionKey: env.MCP_OAUTH_ENCRYPTION_KEY?.trim() || undefined,
@@ -356,6 +404,14 @@ export function resolveAuthConfig(env: AuthEnv, transport: string): AuthResoluti
         warnings.push(
           "MCP_OAUTH_JWT_SIGNING_KEY / MCP_OAUTH_ENCRYPTION_KEY not set — keys are generated per process. " +
           "Note that OAuth sessions do not survive a restart regardless, since token storage is in-memory.",
+        );
+      }
+
+      if (allowedEmailDomains.length === 0) {
+        warnings.push(
+          `MCP_OAUTH_ALLOWED_EMAIL_DOMAINS is not set — any account able to sign in to tenant "${tenant.value}" ` +
+          "(including any guest/B2B account added to it) can use this server. Set it to a comma-separated " +
+          "allowlist, e.g. imbpartners.com, to restrict access by email domain.",
         );
       }
     }
@@ -415,6 +471,11 @@ function unauthorized(): never {
   throw new Response(null, { status: 401, statusText: "Unauthorized" });
 }
 
+/** Distinct from unauthorized(): the caller proved who they are, but that identity isn't allowed. */
+function forbidden(): never {
+  throw new Response(null, { status: 403, statusText: "Forbidden" });
+}
+
 /**
  * Build the `authenticate` function FastMCP calls for every request.
  *
@@ -429,17 +490,20 @@ function unauthorized(): never {
  * at all. tests/auth.test.ts pins this.
  */
 export function createAuthenticator(opts: {
+  allowedEmailDomains?: string[];
   allowQueryToken?: boolean;
   oauthProvider?: OAuthDelegate;
   staticToken?: string;
 }): (request: IncomingMessage | undefined) => Promise<AuthenticatedSession> {
-  const { allowQueryToken = false, oauthProvider, staticToken } = opts;
+  const { allowedEmailDomains = [], allowQueryToken = false, oauthProvider, staticToken } = opts;
 
   return async (request: IncomingMessage | undefined): Promise<AuthenticatedSession> => {
     const presented = extractPresentedToken(request, { allowQueryToken });
 
     // Static token. Skipped entirely when none is configured, so an empty
     // presented value can never compare equal to an empty configured value.
+    // Bypasses the email allowlist below by design — it's not tied to any
+    // Microsoft identity, so there's no email to check.
     if (staticToken && presented && safeTokenEqual(presented, staticToken)) {
       return { authenticated: true, method: "static" };
     }
@@ -447,6 +511,11 @@ export function createAuthenticator(opts: {
     if (oauthProvider) {
       const session = await oauthProvider.authenticate(request);
       if (session) {
+        const idToken = (session as Record<string, unknown>).idToken;
+        const email = extractIdTokenEmail(typeof idToken === "string" ? idToken : undefined);
+        if (!isEmailDomainAllowed(email, allowedEmailDomains)) {
+          forbidden();
+        }
         return { ...(session as Record<string, unknown>), authenticated: true, method: "oauth" };
       }
     }
