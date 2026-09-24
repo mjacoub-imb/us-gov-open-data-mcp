@@ -20,7 +20,7 @@ ENV MCP_HOST=0.0.0.0
 # removed; each tool stays reachable as an `operation` (see server/facade.ts).
 ENV TOOL_MODE=grouped
 # Load only the modules this deployment actually researches with (PE diligence:
-# utility/infrastructure/energy-services). The other 27 stay in the image and
+# utility/infrastructure/energy-services). The other 29 stay in the image and
 # on disk — they are simply not registered, so they cost no tools/list bytes.
 # Drop a name here and it disappears from the model's context; add it back and
 # it returns, no rebuild of the module needed.
@@ -31,15 +31,15 @@ ENV TOOL_MODE=grouped
 #   usaspending        govcon revenue screening (federal vs. state/local exposure)
 #   federal-register,regulations,congress
 #                      infrastructure/grid-hardening regulatory + legislative tracking
-#   dol                labor/wage benchmarking (labor-shortage thesis)
-#   socrata            state & local portals — incl. STATE budgets/appropriations
-#   nhtsa,bts          fleet/trucking components
-#   uspto              proprietary tech/IP diligence
-#   census,hud         geographic market-expansion analysis
+#   bts                fleet/trucking components
+#   census             geographic market-expansion analysis
+#   epa                environmental compliance/permitting exposure
+#   nrel               clean-energy/renewables siting data
+#   usgs               geological/hazard data for site diligence
 #
 # `congress` alone is ~22K chars of the ~80K preamble (71 operations across 5
 # facades) — it is the first thing to cut if more headroom is needed.
-ENV MODULES=fred,treasury,bea,eia,sec,usaspending,federal-register,regulations,congress,dol,socrata,nhtsa,bts,uspto,census,hud
+ENV MODULES=sec,eia,bea,usaspending,congress,fred,census,treasury,bts,federal-register,epa,nrel,usgs,regulations
 # `congress` is loaded only to track infrastructure/energy legislation STATUS,
 # which congress_bills covers on its own (bill text, status, sponsors). The
 # other four facades are a different job and are not part of the deal workflow:
